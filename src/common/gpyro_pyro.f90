@@ -1,0 +1,5730 @@
+! *****************************************************************************
+MODULE GPYRO_PYRO
+! *****************************************************************************
+
+USE PREC
+USE GPYRO_VARS
+USE GPYRO_FUNCS
+USE GPYRO_IO
+USE GPYRO_BC
+
+IMPLICIT NONE
+
+CONTAINS
+
+! *****************************************************************************
+SUBROUTINE GPYRO_PYROLYSIS(IMESH,ICASE,NCELLZ,NCELLX,NCELLY,TI,FAILED_TIMESTEP)
+! *****************************************************************************
+
+INTEGER,  INTENT(IN)  :: IMESH,ICASE,NCELLZ,NCELLX,NCELLY
+REAL(EB), INTENT(INOUT) :: TI
+LOGICAL, INTENT(OUT) :: FAILED_TIMESTEP
+
+! Local variables
+INTEGER :: IZ,IX,IY,ISSPEC,IGSPEC,LUCONVG=1700
+INTEGER :: ITER, ITER_TMP, ITER_P, ITER_HG
+INTEGER, DIMENSION (0:30) :: ITER_YIS, ITER_YJG
+
+LOGICAL :: UPDATE_COEFFS,CONVERGED_ALL,LOPEN 
+REAL(EB) :: DTIME_TMP,DTIME_YIS,DTIME_YJG,DTIME_P,DTIME_HG,TSTART,TMID,TEND,RESID,YJ
+
+LOGICAL :: TMPCONVERGED, PCONVERGED, HGCONVERGED
+LOGICAL :: ALLTMPCONVERGED, ALLPCONVERGED, ALLHGCONVERGED
+CHARACTER(300) :: MESSAGE,FN
+CHARACTER(2) :: TWO
+
+REAL(EB), DIMENSION(1:20) :: RESIDMAX
+INTEGER , DIMENSION(1:20) :: IZMAX, IXMAX, IYMAX
+
+CHARACTER(2000) :: WRITESTR, STR
+
+! Store initial cpu time at first call
+CALL GET_CPU_TIME(TSTART)
+
+G=>GPM(IMESH)
+GPBCP(1:,1:,1:,-3:)=>G%GPYRO_BOUNDARY_CONDITION(1:,1:,1:,-3:)
+
+! Calculate timestep
+DTIME_TMP   = TI - G%TLAST_TMP
+DTIME_YIS   = TI - G%TLAST_YIS
+DTIME_YJG   = TI - G%TLAST_YJG
+DTIME_P     = TI - G%TLAST_P
+DTIME_HG    = TI - G%TLAST_HG
+
+G%TLAST_TMP = TI
+G%TLAST_YIS = TI
+G%TLAST_YJG = TI
+G%TLAST_P   = TI
+G%TLAST_HG  = TI
+
+! Initialize misc variables
+ITER            = 0
+FAILED_TIMESTEP = .FALSE.
+!FIRSTCALL       = .TRUE. 
+
+! Set convergence variables according to which equations are 
+! being solved.  If an equation isn't being solved, we automatically
+! set its convergence status to true. 
+GPG%NAN         = .FALSE.
+CONVERGED_ALL   = .FALSE.
+TMPCONVERGED    = .FALSE.
+YISCONVERGED(:) = .FALSE.
+YJGCONVERGED(:) = .FALSE.
+PCONVERGED      = .FALSE.
+HGCONVERGED     = .FALSE.
+
+G%CONVERGED_TMP(:,:,:)   = .FALSE.
+
+IF (SPROP%NRXN .EQ. 0 .OR. GPG%NOCONSUMPTION) THEN 
+   G%CONVERGED_YIS(:,:,:,:) = .TRUE.
+ELSE
+   G%CONVERGED_YIS(:,:,:,:) = .FALSE. ; 
+ENDIF
+
+IF (GPG%SOLVE_GAS_YJ) THEN
+   G%CONVERGED_YJG(:,:,:,:) = .FALSE.
+ELSE
+   G%CONVERGED_YJG(:,:,:,:) = .TRUE.  ; 
+ENDIF
+
+IF (GPG%SOLVE_PRESSURE) THEN 
+   G%CONVERGED_P  (:,:,:)   = .FALSE.
+ELSE
+   G%CONVERGED_P  (:,:,:)   = .TRUE.  ; 
+ENDIF
+
+IF (GPG%SOLVE_GAS_ENERGY .AND. (.NOT. GPG%THERMAL_EQUILIBRIUM)) THEN
+   G%CONVERGED_HG (:,:,:)   = .FALSE.
+ELSE 
+   G%CONVERGED_HG(:,:,:) = .TRUE.
+ENDIF
+
+CALL GET_CPU_TIME(TMID)
+GPG%TUSED(4) = GPG%TUSED(4) + TMID - TSTART
+         
+! Begin by getting boundary condition info. We only need to do this once
+! per timestep (not every iteration). 
+CALL GET_ALL_BOUNDARY_CONDITIONS(IMESH,TI)
+
+DO WHILE (ITER .LE. GPG%NTDMA_ITERATIONS .AND. (.NOT.CONVERGED_ALL))
+   CALL GET_CPU_TIME(TSTART)
+
+   ITER = ITER + 1
+         
+   IF (GPG%NAN) CYCLE
+
+   G%CONVERGED(:,:,:)  = .FALSE.
+   
+   UPDATE_COEFFS=.FALSE.; IF (MOD((ITER+1),GPG%NCOEFF_UPDATE_SKIP) .EQ. 0) UPDATE_COEFFS = .TRUE.
+   IF (ITER .EQ. 1) UPDATE_COEFFS = .TRUE. 
+
+   CALL GET_CPU_TIME(TMID)
+   GPG%TUSED(4) = GPG%TUSED(4) + TMID - TSTART
+
+   IF (.NOT. TMPCONVERGED) CALL ENERGY_SOURCE_TERMS(IMESH,NCELLZ,NCELLX,NCELLY,DTIME_TMP)
+
+   IF (UPDATE_COEFFS) CALL CALCULATE_WEIGHTED_POINT_QUANTITIES(IMESH,TMPCONVERGED,PCONVERGED,YISCONVERGED(0))
+
+   CALL REACTION_RATE_T(IMESH,NCELLZ,NCELLX,NCELLY)
+   CALL REACTION_RATE_Y(IMESH,NCELLZ,NCELLX,NCELLY)
+
+   IF (SPROP%NRXN .GT. 0) CALL SPECIES_SOURCE_TERMS(IMESH,NCELLZ,NCELLX,NCELLY, YISCONVERGED(0), YJGCONVERGED(0), ITER) !Call every iteration
+
+! Get pyrolysate mass flux. This is not where the darcy mass flux is calculated
+   IF (SPROP%NRXN .GT. 0 .AND. NCELLX .EQ. 1 .AND. NCELLY .EQ. 1 .AND. (.NOT. GPG%SOLVE_PRESSURE)) CALL CALC_MDOTPPZ(IMESH,NCELLZ,NCELLX,NCELLY) !Call every iteration
+
+! Get D
+   IF (UPDATE_COEFFS .AND. GPG%SOLVE_PRESSURE .OR. GPG%SOLVE_GAS_YJ .OR. GPG%SOLVE_GAS_ENERGY) CALL GET_D(IMESH,NCELLZ,NCELLX,NCELLY,MIN(GPROP%IBG,GPROP%NGSPEC),MIN(GPROP%IO2,GPROP%NGSPEC))
+   
+!Calculate volumetric heat transfer coefficient
+   IF (UPDATE_COEFFS .AND. (.NOT. GPG%THERMAL_EQUILIBRIUM) .AND. GPG%HCV .LT. 0D0) CALL CALC_HCV(IMESH,NCELLZ,NCELLX,NCELLY)
+
+!Update gas density
+   IF (UPDATE_COEFFS .AND. GPG%SOLVE_GAS_YJ) CALL CALCULATE_GAS_DENSITY(IMESH,NCELLZ,NCELLX,NCELLY)
+
+   IF (UPDATE_COEFFS) CALL CALCULATE_INTERFACE_WEIGHTING_FACTORS(IMESH)
+
+   IF (UPDATE_COEFFS .AND. (.NOT. TMPCONVERGED)) CALL CALCULATE_INTERFACE_QUANTITIES(IMESH,'KOC      ',0)
+
+   IF (GPG%SOLVE_PRESSURE .AND. (.NOT. PCONVERGED)) THEN
+     IF (UPDATE_COEFFS) CALL CALCULATE_INTERFACE_QUANTITIES(IMESH,'PERMONU  ',0)
+!     IF (UPDATE_COEFFS .AND. G%GZ .NE. 0D0) CALL CALCULATE_INTERFACE_QUANTITIES(IMESH,'RG       ',0) 
+   ENDIF
+
+   IF (UPDATE_COEFFS .AND. GPG%SOLVE_GAS_YJ ) CALL CALCULATE_INTERFACE_QUANTITIES(IMESH,'PSIRGD   ',0)
+
+   IF (UPDATE_COEFFS .AND. GPG%SHYI_CORRECTION .AND. (.NOT. YISCONVERGED(0)) .AND. (.NOT. TMPCONVERGED)) THEN
+      DO ISSPEC = 1, SPROP%NSSPEC
+         CALL CALCULATE_INTERFACE_QUANTITIES(IMESH,'KOCHI    ',ISSPEC)
+      ENDDO      
+      CALL CALCULATE_SHYI_CORRECTION_COEFFICIENTS(NCELLZ,NCELLX,NCELLY,SPROP%NSSPEC,IMESH)
+   ENDIF
+
+! Get new rho*Dz and new species mass fractions
+   IF (.NOT. YISCONVERGED(0) .AND. SPROP%NRXN .GT. 0) CALL SOLID_SPECIES_SOLVER(IMESH,SPROP%NSSPEC,NCELLZ,NCELLX,NCELLY,DTIME_YIS,G%CONVERGED_YIS,GPG%ALPHA_YIS)
+
+   IF (GPG%FIX_DOMAIN_TEMPERATURE) THEN
+      G%TPN(:,:,:) = GPG%TAMB + GPG%BETA(ICASE) * TI / 60D0
+      G%CONVERGED_TMP(:,:,:) = .TRUE. 
+   ELSE
+      IF (GPG%USE_ANISOTROPIC_SOLID_ENTHALPY_SOLVER) THEN
+         IF (.NOT. TMPCONVERGED) CALL SOLID_ENTHALPY_SOLVER_ANISOTROPIC(NCELLZ,NCELLX,NCELLY,ITER,G%CONVERGED_TMP,GPG%ALPHA_H,DTIME_TMP)
+      ELSE
+         IF (GPG%USE_SOLID_ENTHALPY_SOLVER_TEST) THEN
+            IF (.NOT. TMPCONVERGED) CALL SOLID_ENTHALPY_SOLVER_TEST(NCELLZ,NCELLX,NCELLY,ITER,G%CONVERGED_TMP,GPG%ALPHA_H,DTIME_TMP)
+         ELSE
+            IF (.NOT. TMPCONVERGED) CALL SOLID_ENTHALPY_SOLVER(NCELLZ,NCELLX,NCELLY,ITER,G%CONVERGED_TMP,GPG%ALPHA_H,DTIME_TMP)
+         ENDIF
+      ENDIF
+
+   ENDIF
+
+   IF (GPG%SOLVE_PRESSURE .AND. (.NOT.PCONVERGED)) THEN
+      CALL PRESSURE_SOLVER(IMESH,NCELLZ,NCELLX,NCELLY,DTIME_P,G%CONVERGED_P,GPG%ALPHA_P,ITER)
+      IF (NCELLZ .GT. 1) CALL DARCIAN_MASS_FLUX(IMESH,NCELLZ,NCELLX,NCELLY,'Z')
+      IF (NCELLX .GT. 1) CALL DARCIAN_MASS_FLUX(IMESH,NCELLZ,NCELLX,NCELLY,'X')
+      IF (NCELLY .GT. 1) CALL DARCIAN_MASS_FLUX(IMESH,NCELLZ,NCELLX,NCELLY,'Y')
+   ENDIF
+
+   IF ((GPG%SOLVE_GAS_YJ .OR. GPG%SOLVE_GAS_ENERGY) .AND. ((.NOT. YJGCONVERGED(0)) .OR. (.NOT. HGCONVERGED))) THEN
+      CALL CONVECTIVE_DIFFUSIVE_SOLVER_NEW(IMESH,GPROP%NGSPEC,NCELLZ,NCELLX,NCELLY,GPG%CONV_DIFF_SCHEME,ITER,DTIME_YJG,G%CONVERGED_YJG,GPG%ALPHA_YJG, &
+                                           UPDATE_COEFFS)
+   ENDIF
+
+! Check for convergence
+   CALL GET_CPU_TIME(TSTART)
+   CONVERGED_ALL = .TRUE.
+   IF (GPG%NTDMA_ITERATIONS .EQ. 1) THEN
+      G%CONVERGED(:,:,:)= .TRUE. 
+   ELSE
+!$omp PARALLEL DO SCHEDULE(STATIC) PRIVATE(IZ,IX,IY) SHARED(CONVERGED_ALL)
+      DO IY = 1, NCELLY
+      DO IX = 1, NCELLX
+      DO IZ = 1, NCELLZ
+         IF (G%CONVERGED_TMP(IZ,IX,IY) .AND. G%CONVERGED_YIS(0,IZ,IX,IY) .AND. G%CONVERGED_YJG(0,IZ,IX,IY) .AND. G%CONVERGED_P(IZ,IX,IY) .AND. G%CONVERGED_HG (IZ,IX,IY)) THEN
+            G%CONVERGED(IZ,IX,IY) = .TRUE.
+         ELSE
+            G%CONVERGED(IZ,IX,IY) = .FALSE.
+            CONVERGED_ALL = .FALSE.                              
+         ENDIF
+      ENDDO
+      ENDDO
+      ENDDO
+!$omp END PARALLEL DO
+   ENDIF
+   
+   IF (ITER .NE. 1) THEN
+      ALLTMPCONVERGED    = .TRUE. 
+      ALLYISCONVERGED(:) = .TRUE.
+      ALLYJGCONVERGED(:) = .TRUE.
+      ALLPCONVERGED      = .TRUE.
+      ALLHGCONVERGED     = .TRUE.
+
+!$omp PARALLEL DO SCHEDULE (STATIC) PRIVATE(IZ,IX,IY,IGSPEC,ISSPEC) SHARED(ALLTMPCONVERGED,ALLPCONVERGED,ALLHGCONVERGED,ALLYJGCONVERGED,ALLYISCONVERGED)
+      DO IY = 1, NCELLY
+      DO IX = 1, NCELLX
+      DO IZ = 1, NCELLZ
+         IF (.NOT. G%CONVERGED_TMP (  IZ,IX,IY) ) ALLTMPCONVERGED = .FALSE.
+         IF (.NOT. G%CONVERGED_P   (  IZ,IX,IY) ) ALLPCONVERGED   = .FALSE.
+         IF (.NOT. G%CONVERGED_HG  (  IZ,IX,IY) ) ALLHGCONVERGED  = .FALSE.
+         DO IGSPEC = 1, GPROP%NGSPEC
+            IF (.NOT. G%CONVERGED_YJG (IGSPEC,IZ,IX,IY) ) THEN
+               ALLYJGCONVERGED(IGSPEC) = .FALSE.
+               ALLYJGCONVERGED(0     ) = .FALSE.
+            ENDIF
+         ENDDO
+         DO ISSPEC = 1, SPROP%NSSPEC
+            IF (.NOT. G%CONVERGED_YIS (ISSPEC,IZ,IX,IY) ) THEN
+               ALLYISCONVERGED(ISSPEC) = .FALSE.
+               ALLYISCONVERGED(0     ) = .FALSE.
+            ENDIF
+         ENDDO
+      ENDDO
+      ENDDO
+      ENDDO
+!$omp END PARALLEL DO
+   ELSE
+      ALLTMPCONVERGED    = .FALSE. 
+      ALLYISCONVERGED(:) = .FALSE.
+      ALLYJGCONVERGED(:) = .FALSE.
+      ALLPCONVERGED      = .FALSE.
+      ALLHGCONVERGED     = .FALSE.
+      CONVERGED_ALL      = .FALSE.
+   ENDIF
+
+   IF (ALLTMPCONVERGED .AND. (.NOT. TMPCONVERGED)) THEN
+      TMPCONVERGED = .TRUE. 
+      ITER_TMP = ITER
+   ENDIF
+
+   DO ISSPEC = 0, SPROP%NSSPEC
+      IF (ALLYISCONVERGED(ISSPEC) .AND. (.NOT. YISCONVERGED(ISSPEC))) THEN
+         YISCONVERGED(ISSPEC) = .TRUE. 
+         ITER_YIS(ISSPEC) = ITER
+      ENDIF
+   ENDDO
+
+   IF (GPG%SOLVE_GAS_YJ) THEN 
+      RESIDMAX(:) = 0D0; IZMAX(:) = 1; IXMAX(:) = 1 ; IYMAX(:) = 1
+!$omp PARALLEL DO SCHEDULE(DYNAMIC, 4) PRIVATE(IZ,IX,IY,IGSPEC) SHARED(RESIDMAX,IZMAX,IXMAX,IYMAX)
+      DO IY = 1, NCELLY
+      DO IX = 1, NCELLX
+      DO IZ = 1, NCELLZ
+      DO IGSPEC = 1, GPROP%NGSPEC
+         IF (G%RESIDUAL_YJG(IGSPEC,IZ,IX,IY) .GT. RESIDMAX(IGSPEC)) THEN
+            RESIDMAX(IGSPEC) = G%RESIDUAL_YJG(IGSPEC,IZ,IX,IY)
+            IZMAX   (IGSPEC) = IZ
+            IXMAX   (IGSPEC) = IX
+            IYMAX   (IGSPEC) = IY
+         ENDIF
+      ENDDO
+      ENDDO
+      ENDDO
+      ENDDO
+!$omp END PARALLEL DO
+
+      DO IGSPEC = 0, GPROP%NGSPEC
+         IF (.NOT. (YJGCONVERGED(IGSPEC))) THEN
+            IF (IGSPEC .EQ. 0) CYCLE
+            IF (IGPYRO_TYPE .NE. 3) THEN
+               IZ    = IZMAX   (IGSPEC)
+               IX    = IXMAX   (IGSPEC)
+               IY    = IYMAX   (IGSPEC)
+               RESID = MIN(RESIDMAX(IGSPEC),9.99)
+               YJ    = G%YJGN(IGSPEC,IZ,IX,IY)
+               IF (YJ .NE. YJ) YJ = 9.99
+            ENDIF
+         ENDIF
+
+         IF (ALLYJGCONVERGED(IGSPEC) .AND. (.NOT. YJGCONVERGED(IGSPEC))) THEN
+            YJGCONVERGED(IGSPEC) = .TRUE. 
+            ITER_YJG(IGSPEC) = ITER
+         ENDIF
+      ENDDO
+!            IMESH      TI     ITER   IGSPEC  RESID   YJ  
+9998 FORMAT(   I2, A, F9.4, A, I4, A, I2, A, F9.6, A, F15.6, A, I4, A, I4, A, I4)
+   ENDIF !IF (GPG%SOLVE_GAS_YJ) THEN 
+
+   IF (ALLPCONVERGED .AND. (.NOT. PCONVERGED)) THEN
+      PCONVERGED = .TRUE.
+      ITER_P = ITER
+   ENDIF
+
+   IF (ALLHGCONVERGED .AND. (.NOT. HGCONVERGED)) THEN
+      HGCONVERGED = .TRUE. 
+      ITER_HG = ITER
+   ENDIF
+
+   CALL GET_CPU_TIME(TEND)
+   GPG%TUSED(4) = GPG%TUSED(4) + TEND - TSTART
+
+ENDDO !ITER
+
+5000 FORMAT(A,I2,A,F9.3,A,I3)
+6000 FORMAT(A,I2,A,F9.3,A,I2,A,I3)
+
+CALL GET_CPU_TIME(TSTART)
+
+GPG%NTDMAITS = ITER
+
+IF (IGPYRO_TYPE .NE. 3) THEN
+   IF (.NOT. YISCONVERGED(0)) THEN
+      WRITE(*,80) 'Solid Yi not converged @ time: ', TI
+   ENDIF
+
+   IF (GPG%SOLVE_GAS_YJ .AND. .NOT. ALL(G%CONVERGED_YJG(0,:,:,:)))THEN
+      WRITE(*,80) 'Gas Yj not converged @ time: ', TI
+      WRITE(*,* ) 'Gas Yj max residual: ', MAXVAL(G%RESIDUAL_YJG(:,:,:,:))
+   ENDIF
+
+   IF (.NOT. HGCONVERGED) THEN
+      WRITE(*,80) 'Gas h not converged @ time: ', TI
+   ENDIF
+
+   IF (GPG%SOLVE_PRESSURE .AND. (.NOT. PCONVERGED))THEN
+      WRITE(*,80) 'Pressure not converged @ time: ', TI
+      WRITE(*,* ) 'Pressure max residual: ', MAXVAL(G%RESIDUAL_P(:,:,:))
+      CONTINUE
+   ENDIF
+
+   IF (.NOT. TMPCONVERGED) THEN
+      WRITE(*,80) 'Solid temperature not converged @ time: ', TI
+      WRITE(*,* ) 'Temperature max residual: ', MAXVAL(G%RESIDUAL_TMP(:,:,:))
+   ENDIF
+ENDIF
+
+IF (.NOT. CONVERGED_ALL) THEN
+   IF (GPG%DTNEXT .LE. GPG%DTMIN_KILL .AND. IGPYRO_TYPE .NE. 2) THEN
+      IF (IGPYRO_TYPE .EQ. 1) WRITE(*,81) "Failed timestep.  Timestep can't be reduced anymore at t = ", TI
+      FAILED_TIMESTEP = .FALSE.
+      IF (IGPYRO_TYPE .EQ. 1) THEN
+         MESSAGE='Shutting down because timestep is smaller than DTMIN_KILL.'
+         CALL SHUTDOWN_GPYRO(MESSAGE)
+      ENDIF
+    ELSE
+      IF (IGPYRO_TYPE .NE. 2) THEN
+         IF (GPG%NAN .AND. IGPYRO_TYPE .EQ. 1) WRITE(*,*) 'NaN, +Infinity, or -Infinity encountered.' 
+         IF (IGPYRO_TYPE .EQ. 1) WRITE(*,82) 'Failed timestep at t = ', TI, '. Reducing timestep to ', 0.5D0 * GPG%DTNEXT 
+         FAILED_TIMESTEP = .TRUE.
+         G%TLAST_TMP = TI - DTIME_TMP
+         G%TLAST_YIS = TI - DTIME_YIS
+         G%TLAST_YJG = TI - DTIME_YJG
+         G%TLAST_P   = TI - DTIME_P
+         G%TLAST_HG  = TI - DTIME_HG
+
+         GPG%DTNEXT = 0.5D0 * GPG%DTNEXT
+         GPG%DTNEXT = MAX(GPG%DTNEXT, 1D-4*GPG%DT0)
+         TI = G%TLAST_TMP + GPG%DTNEXT
+
+         DO IY = 1, NCELLY
+         DO IX = 1, NCELLX
+            CALL ROLLBACK_SOLUTION(IX,IY,IMESH)
+         ENDDO
+         ENDDO
+      ELSE !FDS
+      
+         FAILED_TIMESTEP = .TRUE.
+         G%TLAST_TMP = TI - DTIME_TMP
+         G%TLAST_YIS = TI - DTIME_YIS
+         G%TLAST_YJG = TI - DTIME_YJG
+         G%TLAST_P   = TI - DTIME_P
+         G%TLAST_HG  = TI - DTIME_HG
+         
+         DO IY = 1, NCELLY
+         DO IX = 1, NCELLX
+            CALL ROLLBACK_SOLUTION(IX,IY,IMESH)
+         ENDDO
+         ENDDO
+      
+      ENDIF
+      
+      RETURN
+   ENDIF
+ENDIF
+
+ 80 FORMAT (A,F9.4, ' s')
+ 81 FORMAT (A,F9.4, ' s')
+ 82 FORMAT (A,F9.4,A,E12.6, ' s')
+
+! Write convergence info:
+IF (GPG%DUMP_DETAILED_CONVERGENCE) THEN
+
+   INQUIRE(UNIT=LUCONVG+IMESH,OPENED=LOPEN)
+   IF (.NOT. LOPEN) THEN
+      WRITE(TWO,'(I2.2)') IMESH
+      FN = 'iterations_mesh_' // TWO // '.csv'
+      OPEN(UNIT=LUCONVG+IMESH,FILE=TRIM(FN),FORM='FORMATTED',STATUS='REPLACE')
+      WRITESTR='t(s),Dt(s),iter,iter_T,'
+
+      IF (GPG%SOLVE_PRESSURE) WRITESTR = TRIM(WRITESTR) // "iter_P,"
+
+      DO ISSPEC = 1, SPROP%NSSPEC
+         WRITE(TWO,'(I2.2)') ISSPEC
+         WRITESTR = TRIM(WRITESTR) // "iter_YIS(" // TWO // ")," 
+      ENDDO
+
+      IF (GPG%SOLVE_GAS_YJ) THEN 
+         DO IGSPEC = 1, GPROP%NGSPEC
+            WRITE(TWO,'(I2.2)') IGSPEC
+            WRITESTR = TRIM(WRITESTR) // "iter_YJG(" // TWO // ")," 
+         ENDDO
+      ENDIF 
+
+      WRITE(LUCONVG+IMESH,'(A)') TRIM(WRITESTR)
+   ENDIF
+
+   WRITE(WRITESTR,'(2(F12.6,","),2(I3,","))') TI, DTIME_TMP, ITER, ITER_TMP
+
+   IF (GPG%SOLVE_PRESSURE) THEN 
+      WRITE(STR,'(I3,",")') ITER_P
+      WRITESTR = TRIM(WRITESTR) // TRIM(STR)
+   ENDIF
+
+   DO ISSPEC = 1, SPROP%NSSPEC
+      WRITE(STR,'(I3,",")') ITER_YIS(ISSPEC)
+      WRITESTR = TRIM(WRITESTR) // TRIM(STR)
+   ENDDO
+
+   IF (GPG%SOLVE_GAS_YJ) THEN 
+      DO IGSPEC = 1, GPROP%NGSPEC
+         WRITE(STR,'(I3,",")') ITER_YJG(IGSPEC)
+         WRITESTR = TRIM(WRITESTR) // TRIM(STR)
+      ENDDO
+   ENDIF
+
+   WRITE(LUCONVG+IMESH,'(A)') TRIM(WRITESTR)
+
+ENDIF
+
+GPG%DTNEXT = MIN(1.001*GPG%DTNEXT,GPG%DT0)
+
+CALL GET_CPU_TIME(TMID)
+GPG%TUSED(4) = GPG%TUSED(4) + TMID - TSTART
+
+! If this is not a property estimation run, call dump routines
+IF (IGPYRO_TYPE .NE. 3) THEN
+   IF (IGPYRO_TYPE .EQ. 1) CALL DUMP_GPYRO(IMESH,ICASE,TI) !Standalone
+   IF (IGPYRO_TYPE .EQ. 2 .AND. (GPG%MYID .EQ. GPG%PROCESS_GPYRO(IMESH) .OR. (.NOT. GPG%USE_MPI))) CALL DUMP_GPYRO(IMESH,ICASE,TI)
+ENDIF
+
+CALL UPDATE_SOLUTION_OPENMP(IMESH,NCELLZ,NCELLX,NCELLY)
+      
+!CALL GET_CPU_TIME(TEND)
+!GPG%TUSED(4) = GPG%TUSED(4) + TEND - TMID
+
+! *****************************************************************************
+END SUBROUTINE GPYRO_PYROLYSIS
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE TG_DRIVER(ICASE,TI,FAILED_TIMESTEP,TMP)
+! *****************************************************************************
+
+! INTENT IN variables
+INTEGER,  INTENT(IN) :: ICASE
+REAL(EB), INTENT(INOUT) :: TI
+LOGICAL, INTENT(OUT) :: FAILED_TIMESTEP
+REAL(EB), INTENT(IN) :: TMP
+
+! Local variables
+REAL(EB) :: DTIME
+INTEGER :: ITERN,IMESH
+LOGICAL :: CONVERGED,FIRSTCALL !, CONVERGED_YIS(1,1)
+REAL(EB) :: YI_ITERNS(1:SPROP%NSSPEC,1:1,1:GPG%NTDMA_ITERATIONS)
+REAL(EB), SAVE :: ALPHA_H, ALPHA_YIS, ALPHA_YJG, ALPHA_HG, ALPHA_P
+
+IMESH = GPG%IMESH(ICASE)
+G=>GPM(IMESH)
+GPBCP(1:,1:,1:,-3:)=>G%GPYRO_BOUNDARY_CONDITION(1:,1:,1:,-3:)
+
+! Assume local gaseous mass fractions are equal to ambient values:
+! This could be moved elsewhere but it doesn't take up much cpu time
+! so it's probably ok here...
+IF (GPROP%NGSPEC .GT. 1) THEN
+   G%YJG (1:GPROP%NGSPEC,1,1,1) = GPG%INITIAL_CONDITIONS(GPG%DEFAULT_IC(IMESH))%YJ0(1:GPROP%NGSPEC) 
+   G%YJGN(1:GPROP%NGSPEC,1,1,1) = G%YJG (1:GPROP%NGSPEC,1,1,1)
+ENDIF
+
+! Calculate timestep
+DTIME       = TI - G%TLAST_YIS
+G%TLAST_YIS = TI
+
+IF (TI .LE. DTIME) THEN 
+   ALPHA_H   = GPG%ALPHA_H
+   ALPHA_YIS = GPG%ALPHA_YIS
+   ALPHA_YJG = GPG%ALPHA_YJG
+   ALPHA_HG  = GPG%ALPHA_HG
+   ALPHA_P   = GPG%ALPHA_P
+ENDIF
+
+! Calculate temperature assuming linear increase, or using read-in data
+IF (IGPYRO_TYPE .EQ. 3) THEN !If property estimation, use read-in tmp data
+   G%TPN(1,1,1) = TMP + 273.15
+ELSE !Else, do a linear increase
+   G%TPN(1,1,1) = GPG%TAMB + GPG%BETA(ICASE) * TI / 60D0
+ENDIF
+!G%TPN(1,1,1) = GPG%TAMB + GPG%BETA(ICASE) * TI / 60D0
+
+ITERN           = 0
+CONVERGED       = .FALSE.
+FAILED_TIMESTEP = .FALSE.
+FIRSTCALL       = .TRUE.
+
+DO WHILE (ITERN .LT. GPG%NTDMA_ITERATIONS .AND. .NOT. CONVERGED)
+   ITERN = ITERN + 1
+   IF (GPG%NAN) CYCLE
+! FIRSTCALL = .FALSE. ; IF (ITERN .EQ. 1) FIRSTCALL = .TRUE.
+
+! Update grid spacing from continuity equation and
+! estimate species mass fractions at next time step
+   G%CONVERGED_YIS(:,1,1,1) = .FALSE.
+
+   CALL REACTION_RATE_T(IMESH,1,1,1)
+   CALL REACTION_RATE_Y(IMESH,1,1,1)
+   
+   CALL SPECIES_SOURCE_TERMS(IMESH,1,1,1, .FALSE., .FALSE.,1)
+
+   CALL SOLID_SPECIES_SOLVER(IMESH,SPROP%NSSPEC,1,1,1,DTIME,G%CONVERGED_YIS,ALPHA_YIS)
+
+   YI_ITERNS(1:SPROP%NSSPEC,1,ITERN) = G%YIN(1:SPROP%NSSPEC,1,1,1)
+
+
+   IF (G%CONVERGED_YIS(0,1,1,1)) CONVERGED = .TRUE.
+   IF (GPG%NAN                 ) CONVERGED = .FALSE.
+   IF (ITERN .EQ. 1            ) CONVERGED = .FALSE.
+ENDDO
+      
+GPG%NTDMAITS = ITERN
+IF (G%DLTZN(1,1,1) .LE. GPG%EPS) G%CONSUMED(1,1,1) = .TRUE. 
+
+IF (.NOT. CONVERGED) THEN
+
+   IF (GPG%DTNEXT .LE. 1D-4*GPG%DT0) THEN
+      IF (IGPYRO_TYPE .EQ. 1) WRITE(*,*) "Failed timestep. Dt can't be reduced anymore. t = ",TI
+      FAILED_TIMESTEP = .FALSE.
+   ELSE
+      IF (IGPYRO_TYPE .EQ. 1) WRITE(*,*) 'Failed timestep. Reducing Dt. t = ',TI
+      FAILED_TIMESTEP = .TRUE.
+      G%TLAST_YIS = TI - DTIME
+      GPG%DTNEXT = 0.9D0 * GPG%DTNEXT
+      GPG%DTNEXT = MAX(GPG%DTNEXT, 1D-4*GPG%DT0)
+      TI = G%TLAST_YIS + GPG%DTNEXT
+
+      G%TPN(1,1,1)     = G%TP(1,1,1)
+      G%HPN(1,1,1)     = G%HP(1,1,1)
+
+      G%YIN   (:,1,1,1) = G%YI(:,1,1,1)
+      G%XIN   (:,1,1,1) = G%XI(:,1,1,1)
+      G%RPN   (1,1,1)   = G%RP(1,1,1)
+      G%DLTZN (1,1,1)   = G%DLTZ(1,1,1)
+      G%RDLTZN(1,1,1)   = G%RP(1,1,1)*G%DLTZ(1,1,1)
+
+      G%CONSUMED(1,1,1) = .FALSE.
+      IF (G%DLTZ(1,1,1) .LE. GPG%EPS) G%CONSUMED(1,1,1) = .TRUE. 
+
+      RETURN
+   ENDIF
+ENDIF
+      
+! If this is a standlone implementation, call dump routines
+IF(IGPYRO_TYPE .EQ. 1 ) CALL DUMP_GPYRO(1,ICASE,TI)
+
+! Update solution
+CALL UPDATE_SOLUTION(IMESH,1,1,1)
+
+! *****************************************************************************
+END SUBROUTINE TG_DRIVER
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE SOLID_SPECIES_SOLVER(IMESH,NSSPEC,NCELLZ,NCELLX,NCELLY,DTIME,CONVERGED_YIS,ALPHA_YIS)
+! *****************************************************************************
+
+INTEGER, INTENT(IN) :: IMESH,NSSPEC,NCELLZ,NCELLX,NCELLY
+REAL(EB), INTENT(IN) :: DTIME,ALPHA_YIS
+LOGICAL, INTENT(OUT) :: CONVERGED_YIS(0:NSSPEC,1:NCELLZ,1:NCELLX,1:NCELLY)
+LOGICAL :: CONVERGED, CONVERGED_LOCALLY
+INTEGER :: ISPEC,IZ,IX,IY,I
+REAL(EB) :: TSTART,TEND,RDT,YISUM
+REAL(EB), POINTER, DIMENSION (:,:,:) :: RDLTZN_OLD,SUMYIORHOI,TOL,DIFF,RDLTZNOLD,ATDMA,DTDMA
+REAL(EB), POINTER, DIMENSION (:,:,:,:) :: RYIDZN_OLD,YIN_OLD,RHOI,D_TDMA,SM,RYIDZ_DIFF
+
+CALL GET_CPU_TIME(TSTART)
+
+G => GPM(IMESH)
+
+!Arrays (1:NCELLZ,1:NCELLX,1:NCELLY)
+RDLTZN_OLD => G%RWORK01
+SUMYIORHOI => G%RWORK02
+TOL        => G%RWORK03
+DIFF       => G%RWORK04
+RDLTZNOLD  => G%RWORK05
+ATDMA      => G%RWORK06
+DTDMA      => G%RWORK07
+
+!Arrays (1:NSPEC,1:NCELLZ,1:NCELLX,1:NCELLY)
+RYIDZN_OLD => G%RWORK100
+YIN_OLD    => G%RWORK101
+RHOI       => G%RWORK102
+D_TDMA     => G%RWORK103
+SM         => G%RWORK104
+RYIDZ_DIFF => G%RWORK106
+
+RDLTZN_OLD(:,:,:)   = G%RDLTZN (:,:,:)
+RYIDZN_OLD(:,:,:,:) = G%RYIDZPN(:,:,:,:)
+YIN_OLD   (:,:,:,:) = G%YIN    (:,:,:,:)
+SUMYIORHOI(:,:,:)   = 0D0
+
+IF (GPG%NOCONSUMPTION) THEN
+   G%RDLTZN (:,:,:  ) = RDLTZN_OLD(:,:,:  )
+   G%RYIDZPN(:,:,:,:) = RYIDZN_OLD(:,:,:,:)
+ELSE 
+   CONVERGED         = .FALSE.
+   CONVERGED_LOCALLY = .FALSE.
+   RDT               = 1D0/DTIME
+   I                 = 0    
+
+! Continuity equation
+
+!$omp PARALLEL DO SCHEDULE(STATIC)
+   DO IY = 1, NCELLY
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+      TOL  (IZ,IX,IY) = 1D-9 * G%RDLTZ(IZ,IX,IY) * ALPHA_YIS
+      DTDMA(IZ,IX,IY) = G%RDLTZ(IZ,IX,IY) / DTIME
+   ENDDO
+   ENDDO
+   ENDDO
+!$omp END PARALLEL DO
+   
+   DO WHILE (I .LT. GPG%NCONTINUITYITERNS .AND. (.NOT. CONVERGED) )
+      I = I + 1
+!$omp PARALLEL DO SCHEDULE(STATIC)
+      DO IY = 1, NCELLY
+      DO IX = 1, NCELLX
+      DO IZ = 1, NCELLZ
+         RDLTZNOLD(IZ,IX,IY) = G%RDLTZN(IZ,IX,IY)
+         ATDMA(IZ,IX,IY) = RDT + G%GOMEGA(3,0,IZ,IX,IY)*G%DLTZN(IZ,IX,IY) / G%RDLTZN(IZ,IX,IY) 
+         ATDMA(IZ,IX,IY) = ATDMA(IZ,IX,IY) / ALPHA_YIS
+         G%RDLTZN(IZ,IX,IY) = (DTDMA(IZ,IX,IY) + ATDMA(IZ,IX,IY)*RDLTZNOLD(IZ,IX,IY)*(1D0-ALPHA_YIS)) / ATDMA(IZ,IX,IY)
+      ENDDO
+      ENDDO
+      ENDDO
+!$omp END PARALLEL DO
+      ! Check local convergence
+      IF (GPG%NCONTINUITYITERNS .GT. 1) THEN
+         CONVERGED = .TRUE.
+!$omp PARALLEL DO SCHEDULE(STATIC)
+         DO IY = 1, NCELLY
+         DO IX = 1, NCELLX
+         DO IZ = 1, NCELLZ
+            DIFF(IZ,IX,IY)  = ABS(G%RDLTZN(IZ,IX,IY) - RDLTZNOLD(IZ,IX,IY) )
+            IF (DIFF(IZ,IX,IY) .GT. TOL(IZ,IX,IY)) CONVERGED = .FALSE.
+         ENDDO
+         ENDDO
+         ENDDO
+!$omp END PARALLEL DO
+      ENDIF
+   ENDDO
+   
+! update_species
+   I = 0      
+   DO WHILE (I .LT. GPG%NSSPECIESITERNS .AND. (.NOT. CONVERGED_LOCALLY))
+      I = I + 1
+
+!$omp PARALLEL DO SCHEDULE(STATIC)
+      DO IY = 1, NCELLY
+      DO IX = 1, NCELLX
+      DO IZ = 1, NCELLZ
+      DO ISPEC = 1, SPROP%NSSPEC
+         IF (I .EQ. 1) THEN
+            D_TDMA(ISPEC,IZ,IX,IY) = G%RYIDZP(ISPEC,IZ,IX,IY) / DTIME + G%SOMEGA(1,ISPEC,IZ,IX,IY) * G%DLTZN(IZ,IX,IY)
+            SM(ISPEC,IZ,IX,IY) = G%SOMEGA(2,ISPEC,IZ,IX,IY) * G%DLTZN(IZ,IX,IY)
+         ENDIF
+         RYIDZN_OLD(ISPEC,IZ,IX,IY) = G%RYIDZPN(ISPEC,IZ,IX,IY)
+         ATDMA(IZ,IX,IY)= RDT + SM(ISPEC,IZ,IX,IY)/MAX(G%RYIDZPN(ISPEC,IZ,IX,IY),1D-50)
+         IF (ALPHA_YIS .LT. 1D0) ATDMA(IZ,IX,IY) = ATDMA(IZ,IX,IY) / ALPHA_YIS
+         G%RYIDZPN(ISPEC,IZ,IX,IY) = (D_TDMA(ISPEC,IZ,IX,IY) + ATDMA(IZ,IX,IY) * (1D0 - ALPHA_YIS) * RYIDZN_OLD(ISPEC,IZ,IX,IY) ) / ATDMA(IZ,IX,IY) 
+      ENDDO
+      ENDDO
+      ENDDO
+      ENDDO
+!$omp END PARALLEL DO
+
+! Check local loop convergence
+      IF (GPG%NSSPECIESITERNS .GT. 1) THEN
+         CONVERGED_LOCALLY = .TRUE.
+!$omp PARALLEL DO SCHEDULE(STATIC)
+         DO IY = 1, NCELLY
+         DO IX = 1, NCELLX
+         DO IZ = 1, NCELLZ
+         DO ISPEC = 1, SPROP%NSSPEC
+            RYIDZ_DIFF(ISPEC,IZ,IX,IY) = ABS(G%RYIDZPN(ISPEC,IZ,IX,IY) - RYIDZN_OLD(ISPEC,IZ,IX,IY))
+            IF (RYIDZ_DIFF(ISPEC,IZ,IX,IY) .GT. GPG%YITOL*ALPHA_YIS) CONVERGED_LOCALLY = .FALSE.
+         ENDDO
+         ENDDO
+         ENDDO
+         ENDDO
+!$omp END PARALLEL DO
+      ENDIF
+         
+   ENDDO !I ENDDO
+
+ENDIF
+
+! OLD WAY:
+! Extract mass fractions from RYIDZPN and RDLTZN
+! and get new rho of each species
+! Then calculate new density as rho = sigma[ (Yi/rho_i)^-1 ]
+
+!$omp PARALLEL DO SCHEDULE(STATIC)
+DO IY = 1, NCELLY
+DO IX = 1, NCELLX
+DO IZ = 1, NCELLZ
+   DO ISPEC = 1, NSSPEC
+      G%YIN(ISPEC,IZ,IX,IY) = G%RYIDZPN(ISPEC,IZ,IX,IY) / G%RDLTZN(IZ,IX,IY)
+      RHOI(ISPEC,IZ,IX,IY)  = RHOOFT(ISPEC,G%TPN(IZ,IX,IY))
+      SUMYIORHOI(IZ,IX,IY)  = SUMYIORHOI(IZ,IX,IY) + G%YIN(ISPEC,IZ,IX,IY)/RHOI(ISPEC,IZ,IX,IY)
+   ENDDO
+   G%RPN(IZ,IX,IY) = 1D0 / SUMYIORHOI(IZ,IX,IY)
+ENDDO
+ENDDO
+ENDDO
+!$omp END PARALLEL DO
+
+! Could probably combine the below loop with the above loop for performance but let's do it separately first
+G%RSPN(:,:,:) = 0D0
+!$omp PARALLEL DO SCHEDULE(STATIC)
+DO IY = 1, NCELLY
+DO IX = 1, NCELLX
+DO IZ = 1, NCELLZ
+   DO ISPEC = 1, NSSPEC
+      G%RSPN(IZ,IX,IY) = G%RSPN(IZ,IX,IY) + G%YIN(ISPEC,IZ,IX,IY) / SPROP%RS0(ISPEC)
+   ENDDO
+   G%RSPN(IZ,IX,IY) = 1D0 / G%RSPN(IZ,IX,IY)
+ENDDO
+ENDDO
+ENDDO
+!$omp END PARALLEL DO
+
+!IF (NCELLZ .GT. 1 .AND. NCELLX .EQ. 1 .AND. NCELLY .EQ. 1) THEN
+IF (NCELLX .EQ. 1 .AND. NCELLY .EQ. 1) THEN !Need to do this for property estimation too for non-charring reactions
+
+   IF (NCELLZ .GT. 1) THEN
+      ! Get new Dz from rho and rho*Dz
+      G%DLTZN (:,1,1) = G%RDLTZN(:,1,1) / G%RPN(:,1,1)
+      
+      ! Calculate new z values from new Dz
+      G%DZT(:,1,1) = 0D0
+      G%DZB(:,1,1) = 0D0
+
+      DO IZ = 3, NCELLZ-1
+         G%DZT(IZ,1,1) = 0.5D0 * (G%DLTZN(IZ,1,1) + G%DLTZN(IZ-1,1,1))
+      ENDDO
+      G%DZT(2     ,1,1) = G%DLTZN(1     ,1,1) + 0.5D0 * G%DLTZN(2       ,1,1)
+      G%DZT(NCELLZ,1,1) = G%DLTZN(NCELLZ,1,1) + 0.5D0 * G%DLTZN(NCELLZ-1,1,1)
+      G%DZT(1     ,1,1) = G%DZT  (2     ,1,1)
+
+      DO IZ = 2, NCELLZ-2
+         G%DZT(IZ,1,1) = 0.5D0 * (G%DLTZN(IZ,1,1) + G%DLTZN(IZ+1,1,1))
+      ENDDO
+      G%DZT(1       ,1,1) = G%DLTZN(1       ,1,1) + 0.5D0 * G%DLTZN(2       ,1,1)
+      G%DZT(NCELLZ-1,1,1) = G%DLTZN(NCELLZ  ,1,1) + 0.5D0 * G%DLTZN(NCELLZ-1,1,1)
+      G%DZT(NCELLZ  ,1,1) = G%DZT  (NCELLZ-1,1,1)
+
+      DO IZ = 1, NCELLZ - 1
+         G%DZB(IZ,1,1) = G%DZT(IZ+1,1,1)
+      ENDDO
+      G%DZB(NCELLZ,1,1) = G%DZB(NCELLZ-1,1,1)
+
+      G%DXDYDZ(:,:,:) = G%DLTZN (:,:,:)
+   ELSE !This is an 0D simulation
+      ! Get new Dz from rho and rho*Dz
+      G%DLTZN (1,1,1) = G%RDLTZN(1,1,1) / G%RPN(1,1,1)
+   ENDIF
+ENDIF
+
+! Update RYIDZSIGMA
+IF (.NOT. GPG%CONVENTIONAL_RXN_ORDER) THEN
+!$omp PARALLEL DO SCHEDULE(STATIC)
+   DO IY = 1, NCELLY
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+   DO ISPEC = 1, NSSPEC
+      G%RYIDZSIGMAN(ISPEC,IZ,IX,IY)=G%RYIDZSIGMA(ISPEC,IZ,IX,IY) + G%SOMEGA(1,ISPEC,IZ,IX,IY)*G%DLTZN(IZ,IX,IY)*DTIME
+   ENDDO
+   ENDDO
+   ENDDO
+   ENDDO
+!$omp END PARALLEL DO
+ENDIF
+
+! Check convergence (relative tolerance):
+
+CONVERGED_YIS(:,:,:,:) = .TRUE.
+!$omp PARALLEL DO SCHEDULE(STATIC)
+DO IY = 1, NCELLY
+DO IX = 1, NCELLX
+DO IZ = 1, NCELLZ
+   YISUM = 0D0
+   DO ISPEC = 1, NSSPEC
+      YISUM = YISUM + G%YIN(ISPEC,IZ,IX,IY)
+      IF (YISCONVERGED(ISPEC)) CYCLE
+
+      G%RESIDUAL_YIS(ISPEC,IZ,IX,IY) = REAL(G%IMASK(IZ,IX,IY))*ABS(G%YIN(ISPEC,IZ,IX,IY)-YIN_OLD(ISPEC,IZ,IX,IY)) / MAX(GPG%EPS_YIS, YIN_OLD(ISPEC,IZ,IX,IY))
+      IF (G%YIN(ISPEC,IZ,IX,IY).NE.G%YIN(ISPEC,IZ,IX,IY) .OR. G%YIN(ISPEC,IZ,IX,IY).EQ.GPG%POSINF .OR. G%YIN(ISPEC,IZ,IX,IY).EQ.GPG%NEGINF) THEN
+         G%RESIDUAL_YIS(ISPEC,IZ,IX,IY) = 9D9
+         GPG%NAN = .TRUE.
+      ENDIF
+      IF (G%RESIDUAL_YIS(ISPEC,IZ,IX,IY) .GT. GPG%YITOL*ALPHA_YIS) THEN
+         CONVERGED_YIS(ISPEC,IZ,IX,IY) = .FALSE.
+         CONVERGED_YIS(0    ,IZ,IX,IY) = .FALSE.
+      ENDIF
+   ENDDO
+   IF (YISUM .LT. 0.9995 .OR. YISUM .GT. 1.0005) THEN
+      G%RESIDUAL_YIS(:,IZ,IX,IY)=10.
+   ENDIF
+   IF (G%DLTZN(IZ,IX,IY) .NE. G%DLTZN(IZ,IX,IY)) THEN 
+      GPG%NAN=.TRUE.
+   ENDIF
+ENDDO
+ENDDO
+ENDDO
+!$omp END PARALLEL DO
+
+CALL GET_CPU_TIME(TEND)
+GPG%TUSED(15) = GPG%TUSED(15) + TEND - TSTART
+
+! *****************************************************************************
+END SUBROUTINE SOLID_SPECIES_SOLVER
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE UPDATE_SOLUTION(IMESH,NCELLZ,NCELLX,NCELLY)
+! *****************************************************************************
+
+INTEGER, INTENT(IN) :: IMESH,NCELLZ,NCELLX,NCELLY
+REAL(EB) :: TSTART, TEND
+
+CALL GET_CPU_TIME(TSTART)
+
+G=>GPM(IMESH)
+
+! Update solution 
+G%TP(:,:,:) = G%TPN(:,:,:)
+G%HP(:,:,:) = G%HPN(:,:,:)
+        
+IF (GPG%SOLVE_PRESSURE) G%P(:,:,:) = G%PN(:,:,:)
+
+IF (GPG%SOLVE_GAS_YJ) THEN 
+   G%YJG(:,:,:,:) = G%YJGN(:,:,:,:)
+   G%RG(:,:,:)    = G%RGN(:,:,:)
+   IF (GPG%SOLVE_GAS_ENERGY) THEN
+      G%TG(:,:,:) = G%TGN(:,:,:)
+      G%HG(:,:,:) = G%HGN(:,:,:)
+   ENDIF
+ENDIF
+
+IF (GPG%SOLVE_GAS_ENERGY .OR. GPG%SOLVE_GAS_YJ .OR. GPG%SOLVE_PRESSURE) THEN
+   G%POROSS(:,:,:) = G%POROSSN(:,:,:)
+ENDIF
+
+G%YI      (:,:,:,:)   = G%YIN(:,:,:,:)
+G%XI      (:,:,:,:)   = G%XIN(:,:,:,:)
+G%RP      (:,:,:)     = G%RPN(:,:,:)
+G%RSP     (:,:,:)     = G%RSPN(:,:,:)
+G%DLTZ    (:,:,:)     = G%DLTZN(:,:,:)
+G%RDLTZ   (:,:,:)     = G%RDLTZN(:,:,:)
+G%RYIDZP  (:,:,:,:)   = G%RYIDZPN(:,:,:,:)
+G%RYIDZSIGMA(:,:,:,:) = G%RYIDZSIGMAN(:,:,:,:)
+
+IF (NCELLX .EQ. 1 .AND. NCELLY .EQ. 1) THEN
+   G%CONSUMED(:,1,1) = .FALSE.
+   IF (G%DELTAN(1,1) .GT. 0D0) THEN
+      G%DELTAN(1,1) = SUM(G%DLTZN(:,1,1))
+      G%DELTA (1,1) = G%DELTAN(1,1)
+   ENDIF
+
+   WHERE(G%DLTZ(:,:,:) .LE. GPG%EPS) G%CONSUMED(:,:,:) = .TRUE.
+
+   IF (SPROP%NRXN .GT. 0 .AND. (.NOT. GPG%SOLVE_PRESSURE)) CALL CALC_MDOTPPZ(IMESH,NCELLZ,1,1)
+
+ENDIF
+
+CALL GET_CPU_TIME(TEND)
+GPG%TUSED(24) = GPG%TUSED(24) + TEND - TSTART
+
+! *****************************************************************************
+END SUBROUTINE UPDATE_SOLUTION
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE UPDATE_SOLUTION_OPENMP(IMESH,NCELLZ,NCELLX,NCELLY)
+! *****************************************************************************
+
+INTEGER, INTENT(IN) :: IMESH,NCELLZ,NCELLX,NCELLY
+INTEGER :: IZ, IX, IY, IGSPEC, ISSPEC
+REAL(EB) :: TSTART, TEND
+
+CALL GET_CPU_TIME(TSTART)
+
+G=>GPM(IMESH)
+
+! Update solution
+!$omp PARALLEL DO SCHEDULE(DYNAMIC,4)
+DO IY = 1, NCELLY
+DO IX = 1, NCELLX
+DO IZ = 1, NCELLZ
+
+   G%TP    (IZ,IX,IY) = G%TPN   (IZ,IX,IY)
+   G%HP    (IZ,IX,IY) = G%HPN   (IZ,IX,IY)
+   G%RP    (IZ,IX,IY) = G%RPN   (IZ,IX,IY)
+   G%RSP   (IZ,IX,IY) = G%RSPN  (IZ,IX,IY)
+   G%DLTZ  (IZ,IX,IY) = G%DLTZN (IZ,IX,IY)
+   G%RDLTZ (IZ,IX,IY) = G%RDLTZN(IZ,IX,IY)
+
+   DO ISSPEC = 1, SPROP%NSSPEC
+      G%YI        (ISSPEC,IZ,IX,IY)   = G%YIN        (ISSPEC,IZ,IX,IY)
+      G%XI        (ISSPEC,IZ,IX,IY)   = G%XIN        (ISSPEC,IZ,IX,IY)
+      G%RYIDZP    (ISSPEC,IZ,IX,IY)   = G%RYIDZPN    (ISSPEC,IZ,IX,IY)
+      G%RYIDZSIGMA(ISSPEC,IZ,IX,IY)   = G%RYIDZSIGMAN(ISSPEC,IZ,IX,IY)
+   ENDDO
+
+   IF (GPG%SOLVE_GAS_YJ) THEN 
+      G%RG(IZ,IX,IY) = G%RGN(IZ,IX,IY)
+      DO IGSPEC = 1, GPROP%NGSPEC
+         G%YJG(IGSPEC,IZ,IX,IY) = G%YJGN(IGSPEC,IZ,IX,IY)
+      ENDDO 
+   ENDIF
+
+   IF (GPG%SOLVE_PRESSURE) G%P(IZ,IX,IY) = G%PN(IZ,IX,IY)
+
+   IF (GPG%SOLVE_GAS_YJ .AND. GPG%SOLVE_GAS_ENERGY) THEN
+      G%TG(IZ,IX,IY) = G%TGN(IZ,IX,IY)
+      G%HG(IZ,IX,IY) = G%HGN(IZ,IX,IY)
+   ENDIF
+
+   IF (GPG%SOLVE_GAS_ENERGY .OR. GPG%SOLVE_GAS_YJ .OR. GPG%SOLVE_PRESSURE) THEN
+      G%POROSS(IZ,IX,IY) = G%POROSSN(IZ,IX,IY)
+   ENDIF
+
+ENDDO
+ENDDO
+ENDDO
+!$omp END PARALLEL DO
+
+IF (NCELLX .EQ. 1 .AND. NCELLY .EQ. 1) THEN
+   G%CONSUMED(:,1,1) = .FALSE.
+   IF (G%DELTAN(1,1) .GT. 0D0) THEN
+      G%DELTAN(1,1) = SUM(G%DLTZN(:,1,1))
+      G%DELTA (1,1) = G%DELTAN(1,1)
+   ENDIF
+
+   WHERE(G%DLTZ(:,:,:) .LE. GPG%EPS) G%CONSUMED(:,:,:) = .TRUE.
+
+   IF (SPROP%NRXN .GT. 0 .AND. (.NOT. GPG%SOLVE_PRESSURE)) CALL CALC_MDOTPPZ(IMESH,NCELLZ,1,1)
+
+ENDIF
+
+CALL GET_CPU_TIME(TEND)
+GPG%TUSED(24) = GPG%TUSED(24) + TEND - TSTART
+
+! *****************************************************************************
+END SUBROUTINE UPDATE_SOLUTION_OPENMP
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE ROLLBACK_SOLUTION(IXP,IYP,IMESH)
+! *****************************************************************************
+
+INTEGER, INTENT(IN) :: IXP,IYP,IMESH
+
+G=>GPM(IMESH)
+GPBCP(1:,1:,1:,-3:)=>G%GPYRO_BOUNDARY_CONDITION(1:,1:,1:,-3:)
+
+G%TPN(:,IXP,IYP)     = G%TP(:,IXP,IYP)
+G%HPN(:,IXP,IYP)     = G%HP(:,IXP,IYP)
+IF (GPG%SOLVE_PRESSURE) G%PN(:,IXP,IYP) = G%P(:,IXP,IYP)
+IF (GPG%SOLVE_GAS_YJ) THEN 
+   G%YJGN(:,:,IXP,IYP) = G%YJG(:,:,IXP,IYP)
+   G%RGN(:,IXP,IYP)    = G%RG(:,IXP,IYP)
+   IF (GPG%SOLVE_GAS_ENERGY) THEN
+      G%TGN(:,IXP,IYP)     = G%TG(:,IXP,IYP)
+      G%HGN(:,IXP,IYP)     = G%HG(:,IXP,IYP)      
+   ENDIF
+ENDIF
+      
+IF (GPG%SOLVE_GAS_ENERGY .OR. GPG%SOLVE_GAS_YJ .OR. GPG%SOLVE_PRESSURE) THEN
+   G%POROSSN(:,IXP,IYP) = G%POROSS(:,IXP,IYP)
+ENDIF
+
+G%YIN   (:,:,IXP,IYP) = G%YI(:,:,IXP,IYP)
+G%XIN   (:,:,IXP,IYP) = G%XI(:,:,IXP,IYP)
+G%RPN   (:,IXP,IYP)   = G%RP(:,IXP,IYP)
+G%RSPN  (:,IXP,IYP)   = G%RSP(:,IXP,IYP)
+G%DLTZN (:,IXP,IYP)   = G%DLTZ(:,IXP,IYP)
+G%RDLTZN(:,IXP,IYP)   = G%RP(:,IXP,IYP)*G%DLTZ(:,IXP,IYP)
+
+IF (G%DELTA(IXP,IYP) .GT. 0D0) THEN
+   G%DELTA(IXP,IYP) = SUM(G%DLTZ(:,IXP,IYP))
+   G%DELTAN(IXP,IYP)  = G%DELTA(IXP,IYP)
+ENDIF
+
+G%CONSUMED(:,IXP,IYP) = .FALSE.
+IF (GPG%SOLVE_PRESSURE) THEN !Should calculate this from pressure gradient, fix! 
+   G%MDOTPPDARCYT(:,IXP,IYP) = 0D0 
+   G%MDOTPPDARCYB(:,IXP,IYP) = 0D0
+   IF (G%NCELLX .GT. 1) THEN 
+      G%MDOTPPDARCYE(:,IXP,IYP) = 0D0
+      G%MDOTPPDARCYW(:,IXP,IYP) = 0D0
+   ENDIF
+   IF (G%NCELLY .GT. 1) THEN 
+      G%MDOTPPDARCYS(:,IXP,IYP) = 0D0
+      G%MDOTPPDARCYN(:,IXP,IYP) = 0D0
+   ENDIF
+
+ENDIF
+
+WHERE(G%DLTZ(:,IXP,IYP) .LE. GPG%EPS) G%CONSUMED(:,IXP,IYP) = .TRUE. 
+
+! *****************************************************************************
+END SUBROUTINE ROLLBACK_SOLUTION
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE RADIATION_ABSORPTION(QRADNET,NCELL,NSPEC,IIN,IOUT,DELTA,DQRDN,XI,IMASK)
+! *****************************************************************************
+
+REAL(EB), INTENT(IN) :: QRADNET
+INTEGER, INTENT(IN) :: NCELL,NSPEC,IIN,IOUT
+REAL(EB), INTENT(IN), DIMENSION(1:NCELL) :: DELTA
+REAL(EB), INTENT(OUT), DIMENSION(1:NCELL) :: DQRDN
+REAL(EB), INTENT(IN), DIMENSION(1:NSPEC,1:NCELL) :: XI
+INTEGER, INTENT(IN), DIMENSION(1:NCELL) :: IMASK
+REAL(EB), DIMENSION(1:NCELL) :: KAPPA
+
+REAL(EB) :: Q1, Q2, DQ 
+INTEGER :: ISPEC, I, ISIGN
+LOGICAL :: DONE
+
+ISIGN = 1 ; IF (IIN .GT. IOUT) ISIGN = -1 
+
+! Radiation absorption at exposed face:      
+Q1 = QRADNET
+
+IF (Q1 .NE. 0D0) THEN
+   KAPPA(IIN) = 0D0
+   DO ISPEC = 1, NSPEC !For now, only need kappa in first cell (IIN)
+      KAPPA(IIN) = KAPPA(IIN) + XI(ISPEC,IIN)*SPROP%KAPPA(ISPEC)
+   ENDDO
+            
+   IF (KAPPA(IIN) .GT. 1D6) THEN !Surface absorption only
+       DQRDN(IIN) = -Q1 / DELTA(IIN) 
+       IF (ISIGN .EQ. -1) DQRDN(IIN) = -1. * DQRDN(IIN)
+
+   ELSE !In-depth absorption
+      KAPPA(:) = 0D0
+      DO ISPEC = 1, SPROP%NSSPEC
+         KAPPA(:) = KAPPA(:) + XI(ISPEC,:)*SPROP%KAPPA(ISPEC)
+      ENDDO
+
+      DONE = .FALSE. 
+      DO I = IIN, IOUT, ISIGN
+         IF (IMASK(I) .EQ. 0) THEN
+            DONE = .TRUE. 
+         ENDIF
+         IF (DONE) CYCLE
+         Q2 = Q1 * EXP(-KAPPA(I)*DELTA(I))
+         DQ = Q1 - Q2
+         DQRDN(I) = DQRDN(I) - DQ/DELTA(I)
+         Q1 = Q2
+      ENDDO
+      IF (ISIGN .EQ. -1) DQRDN(IOUT:IIN) = -1. * DQRDN(IOUT:IIN)
+   ENDIF
+
+ENDIF
+
+! *****************************************************************************
+END SUBROUTINE RADIATION_ABSORPTION
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE SOLID_ENTHALPY_SOLVER(NCELLZ,NCELLX,NCELLY,ITER,CONVERGED_TMP,ALPHA_H,DTIME)
+! *****************************************************************************
+
+INTEGER, INTENT(IN) :: NCELLX,NCELLY,NCELLZ,ITER
+REAL(EB), INTENT(IN) :: ALPHA_H,DTIME
+LOGICAL, INTENT(OUT) :: CONVERGED_TMP(1:NCELLZ,1:NCELLX,1:NCELLY)
+LOGICAL :: SWEEPZ, SWEEPX, SWEEPY
+INTEGER :: ISPEC,IZ,IX,IY
+REAL(EB) :: TSTART,TMID1,TMID2,TEND,TGUESS,SUMYIC0I,EMIS,QCONV
+REAL(EB), POINTER, DIMENSION(:,:,:) :: AP0,AP,AB,AT,AE,AW,AN,AS,B,TPNOLD,BCSTOT,PTR,BZ,BX,BY,BSTART,APSTART,SNET, &
+                                       DQRDN
+REAL(EB), PARAMETER :: EPS_T = 1.0
+
+CALL GET_CPU_TIME(TSTART)
+
+AP0     => G%RWORK01
+AP      => G%RWORK02
+AB      => G%RWORK03
+AT      => G%RWORK04
+AE      => G%RWORK05
+AW      => G%RWORK06
+AN      => G%RWORK07
+AS      => G%RWORK08
+B       => G%RWORK09
+TPNOLD  => G%RWORK10
+BCSTOT  => G%RWORK11
+PTR     => G%RWORK12
+BZ      => G%RWORK13
+BX      => G%RWORK14
+BY      => G%RWORK15
+BSTART  => G%RWORK16
+APSTART => G%RWORK17
+SNET    => G%RWORK18
+
+!BCSP    => G%RWORK19
+!BCSM    => G%RWORK20
+DQRDN   => G%RWORK19
+
+PTR => G%HPN
+
+! Vary sweep direction across iterations 
+SWEEPZ = .FALSE.
+SWEEPX = .FALSE. 
+SWEEPY = .FALSE. 
+
+IF (ITER .EQ. 1) THEN
+   IF (NCELLZ .GT. 1) SWEEPZ = .TRUE. 
+   IF (NCELLX .GT. 1) SWEEPX = .TRUE. 
+   IF (NCELLY .GT. 1) SWEEPY = .TRUE. 
+ELSE
+   IF (NCELLX .EQ. 1 .AND. NCELLY .EQ. 1) SWEEPZ = .TRUE. 
+
+   IF (NCELLX .GT. 1 .AND. NCELLY .EQ. 1) THEN
+      IF (MOD(ITER,2) .EQ. 0) THEN
+         SWEEPZ = .TRUE. 
+      ELSE
+         SWEEPX = .TRUE. 
+      ENDIF
+   ENDIF
+
+   IF (NCELLX .GT. 1 .AND. NCELLY .GT. 1) THEN
+      IF (MOD(ITER,3) .EQ. 2) SWEEPZ = .TRUE. 
+      IF (MOD(ITER,3) .EQ. 0) SWEEPX = .TRUE. 
+      IF (MOD(ITER,3) .EQ. 1) SWEEPY = .TRUE. 
+   ENDIF
+ENDIF
+
+IF (NCELLZ .GT. 1 .AND. NCELLX .GT. 1 .AND. NCELLY .GT. 1 .AND. GPG%SWEEP_DIRECTION .NE. 'null') THEN
+
+! Set default:
+   IF (MOD(ITER,3) .EQ. 2) SWEEPZ = .TRUE. 
+   IF (MOD(ITER,3) .EQ. 0) SWEEPX = .TRUE. 
+   IF (MOD(ITER,3) .EQ. 1) SWEEPY = .TRUE. 
+
+   IF (TRIM(GPG%SWEEP_DIRECTION) .EQ. 'x') THEN
+      SWEEPZ = .FALSE. 
+      SWEEPX = .TRUE. 
+      SWEEPY = .FALSE.
+   ENDIF
+
+   IF (TRIM(GPG%SWEEP_DIRECTION) .EQ. 'y') THEN
+      SWEEPZ = .FALSE. 
+      SWEEPX = .FALSE. 
+      SWEEPY = .TRUE.
+   ENDIF
+
+   IF (TRIM(GPG%SWEEP_DIRECTION) .EQ. 'z') THEN
+      SWEEPZ = .TRUE. 
+      SWEEPX = .FALSE. 
+      SWEEPY = .FALSE.
+   ENDIF
+
+   IF (TRIM(GPG%SWEEP_DIRECTION) .EQ. 'xy') THEN
+      SWEEPZ = .FALSE. 
+      SWEEPX = .TRUE. 
+      SWEEPY = .TRUE.
+   ENDIF
+
+   IF (TRIM(GPG%SWEEP_DIRECTION) .EQ. 'xz') THEN
+      SWEEPZ = .TRUE. 
+      SWEEPX = .TRUE. 
+      SWEEPY = .FALSE.
+   ENDIF
+
+   IF (TRIM(GPG%SWEEP_DIRECTION) .EQ. 'yz') THEN
+      SWEEPZ = .TRUE. 
+      SWEEPX = .FALSE. 
+      SWEEPY = .TRUE.
+   ENDIF
+
+   IF (TRIM(GPG%SWEEP_DIRECTION) .EQ. 'xyz') THEN
+      SWEEPZ = .TRUE. 
+      SWEEPX = .TRUE. 
+      SWEEPY = .TRUE.
+   ENDIF
+
+ENDIF
+
+! Specify coefficients for TDMA:
+
+IF (NCELLZ .GT. 1 .AND. NCELLX .EQ. 1 .AND. NCELLY .EQ. 1) THEN
+!$omp PARALLEL DO SCHEDULE(STATIC)
+   DO IY = 1, NCELLY
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+      TPNOLD (IZ,IX,IY) = G%TPN(IZ,IX,IY)
+      IF (G%IMASK(IZ,IX,IY) .NE. 0) THEN
+         AP0(IZ,IX,IY) = G%RDLTZ(IZ,IX,IY) * G%DXDY(IZ,IX,IY) / DTIME
+         B  (IZ,IX,IY) = AP0(IZ,IX,IY) * G%HP(IZ,IX,IY)
+         AB (IZ,IX,IY) = G%KOCB(IZ,IX,IY) * G%DXDY(IZ,IX,IY) / G%DZB(IZ,IX,IY)
+         AT (IZ,IX,IY) = G%KOCT(IZ,IX,IY) * G%DXDY(IZ,IX,IY) / G%DZT(IZ,IX,IY)
+         AP (IZ,IX,IY) = AP0(IZ,IX,IY) + AB(IZ,IX,IY) + AT(IZ,IX,IY)
+      ELSE
+         B  (IZ,IX,IY) = G%HP(IZ,IX,IY)
+         AP (IZ,IX,IY) = 1D0
+         AT (IZ,IX,IY) = 0D0
+         AB (IZ,IX,IY) = 0D0
+      ENDIF
+   ENDDO
+   ENDDO
+   ENDDO
+!$omp END PARALLEL DO
+ENDIF
+
+IF (NCELLZ .GT. 1 .AND. NCELLX .GT. 1 .AND. NCELLY .EQ. 1) THEN
+!$omp PARALLEL DO SCHEDULE(STATIC)
+   DO IY = 1, NCELLY
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+      TPNOLD (IZ,IX,IY) = G%TPN(IZ,IX,IY)
+      IF (G%IMASK(IZ,IX,IY) .NE. 0) THEN
+         AP0(IZ,IX,IY) = G%RDLTZ(IZ,IX,IY) * G%DXDY(IZ,IX,IY) / DTIME
+         B  (IZ,IX,IY) = AP0(IZ,IX,IY) * G%HP(IZ,IX,IY)
+         AB (IZ,IX,IY) = G%KOCB(IZ,IX,IY) * G%DXDY(IZ,IX,IY) / G%DZB(IZ,IX,IY)
+         AT (IZ,IX,IY) = G%KOCT(IZ,IX,IY) * G%DXDY(IZ,IX,IY) / G%DZT(IZ,IX,IY)
+         AE (IZ,IX,IY) = G%KOCE(IZ,IX,IY) * G%DYDZ(IZ,IX,IY) / G%DXE(IZ,IX,IY)
+         AW (IZ,IX,IY) = G%KOCW(IZ,IX,IY) * G%DYDZ(IZ,IX,IY) / G%DXW(IZ,IX,IY)
+         AP (IZ,IX,IY) = AP0(IZ,IX,IY) + AB(IZ,IX,IY) + AT(IZ,IX,IY) + AE(IZ,IX,IY) + AW(IZ,IX,IY)
+      ELSE
+         B  (IZ,IX,IY) = G%HP(IZ,IX,IY)
+         AP (IZ,IX,IY) = 1D0
+         AT (IZ,IX,IY) = 0D0
+         AB (IZ,IX,IY) = 0D0
+         AE (IZ,IX,IY) = 0D0
+         AW (IZ,IX,IY) = 0D0
+      ENDIF
+   ENDDO
+   ENDDO
+   ENDDO
+!$omp END PARALLEL DO
+ENDIF
+
+IF (NCELLZ .GT. 1 .AND. NCELLX .GT. 1 .AND. NCELLY .GT. 1) THEN
+!$omp PARALLEL DO SCHEDULE(DYNAMIC,4)
+   DO IY = 1, NCELLY
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+      TPNOLD (IZ,IX,IY) = G%TPN(IZ,IX,IY)
+      IF (G%IMASK(IZ,IX,IY) .NE. 0) THEN
+         AP0(IZ,IX,IY) = G%RDLTZ(IZ,IX,IY) * G%DXDY(IZ,IX,IY) / DTIME
+         B  (IZ,IX,IY) = AP0(IZ,IX,IY) * G%HP(IZ,IX,IY)
+         AB (IZ,IX,IY) = G%KOCB(IZ,IX,IY) * G%DXDY(IZ,IX,IY) / G%DZB(IZ,IX,IY)
+         AT (IZ,IX,IY) = G%KOCT(IZ,IX,IY) * G%DXDY(IZ,IX,IY) / G%DZT(IZ,IX,IY)
+         AE (IZ,IX,IY) = G%KOCE(IZ,IX,IY) * G%DYDZ(IZ,IX,IY) / G%DXE(IZ,IX,IY)
+         AW (IZ,IX,IY) = G%KOCW(IZ,IX,IY) * G%DYDZ(IZ,IX,IY) / G%DXW(IZ,IX,IY)
+         AN (IZ,IX,IY) = G%KOCN(IZ,IX,IY) * G%DXDZ(IZ,IX,IY) / G%DYN(IZ,IX,IY)
+         AS (IZ,IX,IY) = G%KOCS(IZ,IX,IY) * G%DXDZ(IZ,IX,IY) / G%DYS(IZ,IX,IY)
+         AP (IZ,IX,IY) = AP0(IZ,IX,IY) + AB(IZ,IX,IY) + AT(IZ,IX,IY) + AE(IZ,IX,IY) + AW(IZ,IX,IY) + AN(IZ,IX,IY) + AS(IZ,IX,IY)
+      ELSE
+         B  (IZ,IX,IY) = G%HP(IZ,IX,IY)
+         AP (IZ,IX,IY) = 1D0
+         AT (IZ,IX,IY) = 0D0
+         AB (IZ,IX,IY) = 0D0
+         AE (IZ,IX,IY) = 0D0
+         AW (IZ,IX,IY) = 0D0
+         AS (IZ,IX,IY) = 0D0
+         AN (IZ,IX,IY) = 0D0
+      ENDIF
+   ENDDO
+   ENDDO
+   ENDDO
+!$omp END PARALLEL DO
+ENDIF
+
+! Set boundary conditions:
+DQRDN(:,:,:) = 0D0
+IF (NCELLZ .GT. 1 .AND. NCELLX .EQ. 1 .AND. NCELLY .EQ. 1) THEN
+   IX = 1
+   IY = 1
+!$omp PARALLEL DO SCHEDULE(STATIC) PRIVATE(QCONV,EMIS,ISPEC)
+   DO IZ = 1, NCELLZ
+      BCSTOT(IZ,IX,IY) = 0D0
+!      BCSM(IZ,IX,IY) = 0D0
+!      BCSP(IZ,IX,IY) = 0D0
+
+      IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+
+      IF (G%NEEDSBCT(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY,-3)%TFIXED .LT. 0D0) THEN
+! Convection - handled via BCSTOT (Boundary condition source, total)
+            QCONV = GPBCP(IZ,IX,IY,-3)%HC0 * (GPBCP(IZ,IX,IY,-3)%TINF - G%TPN(IZ,IX,IY)) 
+            BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + QCONV / G%DLTZN(IZ,IX,IY)
+
+! Radiation - handled by DQRDN (which is added to SHP).
+            EMIS  = CALC_EMIS(IZ,IX,IY)
+            GPBCP(IZ,IX,IY,-3)%QENET = EMIS * GPBCP(IZ,IX,IY,-3)%QE
+            IF (GPBCP(IZ,IX,IY,-3)%RERAD) GPBCP(IZ,IX,IY,-3)%QENET = GPBCP(IZ,IX,IY,-3)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY,-3)%TINF**4D0)
+
+! In-depth radiation absorption:
+            IF (GPBCP(IZ,IX,IY,-3)%QENET .GT. 0.) THEN
+               CALL RADIATION_ABSORPTION(GPBCP(IZ,IX,IY,-3)%QENET, NCELLZ, SPROP%NSSPEC, IZ, NCELLZ, G%DLTZN(:,IX,IY), DQRDN(:,IX,IY), & 
+               G%XI(:,:,IX,IY), G%IMASK(:,IX,IY))
+               G%SHP(:,1,1) = G%SHP(:,1,1) - DQRDN(:,1,1)
+            ELSE
+               BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + GPBCP(IZ,IX,IY,-3)%QENET / G%DLTZN(IZ,IX,IY)
+            ENDIF
+         ELSE
+            GPBCP(IZ,IX,IY,-3)%HFIXED = 0D0
+            DO ISPEC = 1, SPROP%NSSPEC
+               GPBCP(IZ,IX,IY,-3)%HFIXED = GPBCP(IZ,IX,IY,-3)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY,-3)%TFIXED)
+            ENDDO
+            CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY,-3)%HFIXED)
+         ENDIF
+      ENDIF
+
+      IF (G%NEEDSBCB(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY, 3)%TFIXED .LT. 0D0) THEN         
+! Convection - handled via BCSTOT (Boundary condition source, total)
+            QCONV = GPBCP(IZ,IX,IY, 3)%HC0 * (GPBCP(IZ,IX,IY, 3)%TINF - G%TPN(IZ,IX,IY)) 
+            BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + QCONV / G%DLTZN(IZ,IX,IY)
+
+! Radiation - handled by DQRDN (which is added to SHP).
+            EMIS  = CALC_EMIS(IZ,IX,IY)
+            GPBCP(IZ,IX,IY, 3)%QENET = EMIS * GPBCP(IZ,IX,IY, 3)%QE
+            IF (GPBCP(IZ,IX,IY, 3)%RERAD) GPBCP(IZ,IX,IY, 3)%QENET = GPBCP(IZ,IX,IY, 3)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY, 3)%TINF**4D0)
+
+! In-depth radiation absorption:
+            IF (GPBCP(IZ,IX,IY, 3)%QENET .GT. 0.) THEN
+               CALL RADIATION_ABSORPTION(GPBCP(IZ,IX,IY,3)%QENET, NCELLZ, SPROP%NSSPEC, IZ, 1, G%DLTZN(:,IX,IY), DQRDN(:,IX,IY), & 
+               G%XI(:,:,IX,IY), G%IMASK(:,IX,IY))
+               G%SHP(:,1,1) = G%SHP(:,1,1) + DQRDN(:,1,1)
+            ELSE
+               BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + GPBCP(IZ,IX,IY,3)%QENET / G%DLTZN(IZ,IX,IY)
+            ENDIF
+         ELSE
+            GPBCP(IZ,IX,IY, 3)%HFIXED = 0D0
+            DO ISPEC = 1, SPROP%NSSPEC
+               GPBCP(IZ,IX,IY, 3)%HFIXED = GPBCP(IZ,IX,IY, 3)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY, 3)%TFIXED)
+            ENDDO
+            CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY, 3)%HFIXED)
+         ENDIF
+      ENDIF
+   ENDDO
+!$omp END PARALLEL DO
+ENDIF ! End of 1D section
+
+IF (NCELLZ .GT. 1 .AND. NCELLX .GT. 1 .AND. NCELLY .EQ. 1) THEN
+   IY = 1
+
+!$omp PARALLEL DO SCHEDULE(STATIC) PRIVATE(QCONV,EMIS,ISPEC)
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+
+      BCSTOT(IZ,IX,IY) = 0D0
+
+      IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+
+      IF (G%NEEDSBCT(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY,-3)%TFIXED .LT. 0D0) THEN         
+             QCONV = GPBCP(IZ,IX,IY,-3)%HC0 * (GPBCP(IZ,IX,IY,-3)%TINF - G%TPN(IZ,IX,IY)) 
+             EMIS  = CALC_EMIS(IZ,IX,IY)
+             GPBCP(IZ,IX,IY,-3)%QENET = EMIS * GPBCP(IZ,IX,IY,-3)%QE
+             IF (GPBCP(IZ,IX,IY,-3)%RERAD) GPBCP(IZ,IX,IY,-3)%QENET = GPBCP(IZ,IX,IY,-3)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY,-3)%TINF**4D0)
+             BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + (QCONV + GPBCP(IZ,IX,IY,-3)%QENET) / G%DLTZN(IZ,IX,IY)
+          ELSE
+             GPBCP(IZ,IX,IY,-3)%HFIXED = 0D0
+             DO ISPEC = 1, SPROP%NSSPEC
+                GPBCP(IZ,IX,IY,-3)%HFIXED = GPBCP(IZ,IX,IY,-3)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY,-3)%TFIXED)
+             ENDDO
+             CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY,-3)%HFIXED)
+          ENDIF
+       ENDIF
+
+      IF (G%NEEDSBCB(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY, 3)%TFIXED .LT. 0D0) THEN         
+            QCONV = GPBCP(IZ,IX,IY, 3)%HC0 * (GPBCP(IZ,IX,IY, 3)%TINF - G%TPN(IZ,IX,IY)) 
+            EMIS  = CALC_EMIS(IZ,IX,IY)
+            GPBCP(IZ,IX,IY, 3)%QENET = EMIS * GPBCP(IZ,IX,IY, 3)%QE
+            IF (GPBCP(IZ,IX,IY, 3)%RERAD) GPBCP(IZ,IX,IY, 3)%QENET = GPBCP(IZ,IX,IY, 3)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY, 3)%TINF**4D0)
+            BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + (QCONV + GPBCP(IZ,IX,IY, 3)%QENET) / G%DLTZN(IZ,IX,IY)
+         ELSE
+            GPBCP(IZ,IX,IY, 3)%HFIXED = 0D0
+            DO ISPEC = 1, SPROP%NSSPEC
+               GPBCP(IZ,IX,IY, 3)%HFIXED = GPBCP(IZ,IX,IY, 3)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY, 3)%TFIXED)
+            ENDDO
+            CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY, 3)%HFIXED)
+         ENDIF
+      ENDIF
+
+      IF (G%NEEDSBCW(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY,-1)%TFIXED .LT. 0D0) THEN         
+            QCONV = GPBCP(IZ,IX,IY,-1)%HC0 * (GPBCP(IZ,IX,IY,-1)%TINF - G%TPN(IZ,IX,IY)) 
+            EMIS  = CALC_EMIS(IZ,IX,IY)
+            GPBCP(IZ,IX,IY,-1)%QENET = EMIS * GPBCP(IZ,IX,IY,-1)%QE
+            IF (GPBCP(IZ,IX,IY,-1)%RERAD) GPBCP(IZ,IX,IY,-1)%QENET = GPBCP(IZ,IX,IY,-1)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY,-1)%TINF**4D0)
+            BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + (QCONV + GPBCP(IZ,IX,IY,-1)%QENET) / G%DLTXN(IZ,IX,IY)
+         ELSE
+            GPBCP(IZ,IX,IY,-1)%HFIXED = 0D0
+            DO ISPEC = 1, SPROP%NSSPEC
+               GPBCP(IZ,IX,IY,-1)%HFIXED = GPBCP(IZ,IX,IY,-1)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY,-1)%TFIXED)
+            ENDDO
+            CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY,-1)%HFIXED)
+         ENDIF
+      ENDIF
+
+      IF (G%NEEDSBCE(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY,1)%TFIXED .LT. 0D0) THEN         
+            QCONV = GPBCP(IZ,IX,IY, 1)%HC0 * (GPBCP(IZ,IX,IY,1)%TINF - G%TPN(IZ,IX,IY)) 
+            EMIS  = CALC_EMIS(IZ,IX,IY)
+            GPBCP(IZ,IX,IY, 1)%QENET = EMIS * GPBCP(IZ,IX,IY, 1)%QE
+            IF (GPBCP(IZ,IX,IY, 1)%RERAD) GPBCP(IZ,IX,IY, 1)%QENET = GPBCP(IZ,IX,IY, 1)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY, 1)%TINF**4D0)
+            BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + (QCONV + GPBCP(IZ,IX,IY, 1)%QENET) / G%DLTXN(IZ,IX,IY)
+         ELSE
+            GPBCP(IZ,IX,IY, 1)%HFIXED = 0D0
+            DO ISPEC = 1, SPROP%NSSPEC
+               GPBCP(IZ,IX,IY, 1)%HFIXED = GPBCP(IZ,IX,IY, 1)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY, 1)%TFIXED)
+            ENDDO
+            CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY, 1)%HFIXED)
+         ENDIF
+      ENDIF
+
+   ENDDO
+   ENDDO
+!$omp END PARALLEL DO
+ENDIF !End of 2D section
+
+IF (NCELLZ .GT. 1 .AND. NCELLX .GT. 1 .AND. NCELLY .GT. 1) THEN
+!$omp PARALLEL DO SCHEDULE(STATIC) PRIVATE(QCONV,EMIS,ISPEC)
+   DO IY = 1, NCELLY
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+
+      BCSTOT(IZ,IX,IY) = 0D0
+
+      IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+
+      IF (G%NEEDSBCT(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY,-3)%TFIXED .LT. 0D0) THEN         
+             QCONV = GPBCP(IZ,IX,IY,-3)%HC0 * (GPBCP(IZ,IX,IY,-3)%TINF - G%TPN(IZ,IX,IY)) 
+             EMIS  = CALC_EMIS(IZ,IX,IY)
+             GPBCP(IZ,IX,IY,-3)%QENET = EMIS * GPBCP(IZ,IX,IY,-3)%QE
+             IF (GPBCP(IZ,IX,IY,-3)%RERAD) GPBCP(IZ,IX,IY,-3)%QENET = GPBCP(IZ,IX,IY,-3)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY,-3)%TINF**4D0)
+             BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + (QCONV + GPBCP(IZ,IX,IY,-3)%QENET) / G%DLTZN(IZ,IX,IY)
+          ELSE
+             GPBCP(IZ,IX,IY,-3)%HFIXED = 0D0
+             DO ISPEC = 1, SPROP%NSSPEC
+                GPBCP(IZ,IX,IY,-3)%HFIXED = GPBCP(IZ,IX,IY,-3)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY,-3)%TFIXED)
+             ENDDO
+             CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY,-3)%HFIXED)
+          ENDIF
+       ENDIF
+
+      IF (G%NEEDSBCB(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY, 3)%TFIXED .LT. 0D0) THEN         
+            QCONV = GPBCP(IZ,IX,IY, 3)%HC0 * (GPBCP(IZ,IX,IY, 3)%TINF - G%TPN(IZ,IX,IY)) 
+            EMIS  = CALC_EMIS(IZ,IX,IY)
+            GPBCP(IZ,IX,IY, 3)%QENET = EMIS * GPBCP(IZ,IX,IY, 3)%QE
+            IF (GPBCP(IZ,IX,IY, 3)%RERAD) GPBCP(IZ,IX,IY, 3)%QENET = GPBCP(IZ,IX,IY, 3)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY, 3)%TINF**4D0)
+            BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + (QCONV + GPBCP(IZ,IX,IY, 3)%QENET) / G%DLTZN(IZ,IX,IY)
+         ELSE
+            GPBCP(IZ,IX,IY, 3)%HFIXED = 0D0
+            DO ISPEC = 1, SPROP%NSSPEC
+               GPBCP(IZ,IX,IY, 3)%HFIXED = GPBCP(IZ,IX,IY, 3)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY, 3)%TFIXED)
+            ENDDO
+            CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY, 3)%HFIXED)
+         ENDIF
+      ENDIF
+
+      IF (G%NEEDSBCW(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY,-1)%TFIXED .LT. 0D0) THEN         
+            QCONV = GPBCP(IZ,IX,IY,-1)%HC0 * (GPBCP(IZ,IX,IY,-1)%TINF - G%TPN(IZ,IX,IY)) 
+            EMIS  = CALC_EMIS(IZ,IX,IY)
+            GPBCP(IZ,IX,IY,-1)%QENET = EMIS * GPBCP(IZ,IX,IY,-1)%QE
+            IF (GPBCP(IZ,IX,IY,-1)%RERAD) GPBCP(IZ,IX,IY,-1)%QENET = GPBCP(IZ,IX,IY,-1)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY,-1)%TINF**4D0)
+            BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + (QCONV + GPBCP(IZ,IX,IY,-1)%QENET) / G%DLTXN(IZ,IX,IY)
+         ELSE
+            GPBCP(IZ,IX,IY,-1)%HFIXED = 0D0
+            DO ISPEC = 1, SPROP%NSSPEC
+               GPBCP(IZ,IX,IY,-1)%HFIXED = GPBCP(IZ,IX,IY,-1)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY,-1)%TFIXED)
+            ENDDO
+            CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY,-1)%HFIXED)
+         ENDIF
+      ENDIF
+
+      IF (G%NEEDSBCE(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY,1)%TFIXED .LT. 0D0) THEN         
+            QCONV = GPBCP(IZ,IX,IY, 1)%HC0 * (GPBCP(IZ,IX,IY,1)%TINF - G%TPN(IZ,IX,IY)) 
+            EMIS  = CALC_EMIS(IZ,IX,IY)
+            GPBCP(IZ,IX,IY, 1)%QENET = EMIS * GPBCP(IZ,IX,IY, 1)%QE
+            IF (GPBCP(IZ,IX,IY, 1)%RERAD) GPBCP(IZ,IX,IY, 1)%QENET = GPBCP(IZ,IX,IY, 1)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY, 1)%TINF**4D0)
+            BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + (QCONV + GPBCP(IZ,IX,IY, 1)%QENET) / G%DLTXN(IZ,IX,IY)
+         ELSE
+            GPBCP(IZ,IX,IY, 1)%HFIXED = 0D0
+            DO ISPEC = 1, SPROP%NSSPEC
+               GPBCP(IZ,IX,IY, 1)%HFIXED = GPBCP(IZ,IX,IY, 1)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY, 1)%TFIXED)
+            ENDDO
+            CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY, 1)%HFIXED)
+         ENDIF
+      ENDIF
+
+      IF (G%NEEDSBCS(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY,-2)%TFIXED .LT. 0D0) THEN
+            QCONV = GPBCP(IZ,IX,IY,-2)%HC0 * (GPBCP(IZ,IX,IY,-2)%TINF - G%TPN(IZ,IX,IY)) 
+            EMIS  = CALC_EMIS(IZ,IX,IY)
+            GPBCP(IZ,IX,IY,-2)%QENET = EMIS * GPBCP(IZ,IX,IY,-2)%QE
+            IF (GPBCP(IZ,IX,IY,-2)%RERAD) GPBCP(IZ,IX,IY,-2)%QENET = GPBCP(IZ,IX,IY,-2)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY,-2)%TINF**4D0)
+            BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + (QCONV + GPBCP(IZ,IX,IY,-2)%QENET) / G%DLTYN(IZ,IX,IY)
+         ELSE
+            GPBCP(IZ,IX,IY,-2)%HFIXED = 0D0
+            DO ISPEC = 1, SPROP%NSSPEC
+               GPBCP(IZ,IX,IY,-2)%HFIXED = GPBCP(IZ,IX,IY,-2)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY,-2)%TFIXED)
+            ENDDO
+            CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY,-2)%HFIXED)
+         ENDIF
+      ENDIF
+
+      IF (G%NEEDSBCN(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY, 2)%TFIXED .LT. 0D0) THEN
+            QCONV = GPBCP(IZ,IX,IY, 2)%HC0 * (GPBCP(IZ,IX,IY, 2)%TINF - G%TPN(IZ,IX,IY)) 
+            EMIS  = CALC_EMIS(IZ,IX,IY)
+            GPBCP(IZ,IX,IY, 2)%QENET = EMIS * GPBCP(IZ,IX,IY, 2)%QE
+            IF (GPBCP(IZ,IX,IY, 2)%RERAD) GPBCP(IZ,IX,IY, 2)%QENET = GPBCP(IZ,IX,IY, 2)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY, 2)%TINF**4D0)
+            BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + (QCONV + GPBCP(IZ,IX,IY, 2)%QENET) / G%DLTYN(IZ,IX,IY)
+         ELSE
+            GPBCP(IZ,IX,IY, 2)%HFIXED = 0D0
+            DO ISPEC = 1, SPROP%NSSPEC
+               GPBCP(IZ,IX,IY, 2)%HFIXED = GPBCP(IZ,IX,IY, 2)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY, 2)%TFIXED)
+            ENDDO
+            CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY, 2)%HFIXED)
+         ENDIF
+      ENDIF
+
+   ENDDO
+   ENDDO
+   ENDDO
+!$omp END PARALLEL DO
+ENDIF !End of 3D section
+
+IF (GPG%SHYI_CORRECTION) THEN
+
+!$omp PARALLEL DO SCHEDULE(STATIC)
+   DO IY = 1, NCELLY
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+      IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+      B (IZ,IX,IY) = B (IZ,IX,IY) + G%SHYIDTDMAZ(IZ,IX,IY) 
+      AP(IZ,IX,IY) = AP(IZ,IX,IY) + G%SHYIAPZ(IZ,IX,IY) / G%HPN(IZ,IX,IY)
+   
+      IF (NCELLX .GT. 1) THEN 
+         B (IZ,IX,IY) = B (IZ,IX,IY) + G%SHYIDTDMAX(IZ,IX,IY) 
+         AP(IZ,IX,IY) = AP(IZ,IX,IY) + G%SHYIAPX(IZ,IX,IY) / G%HPN(IZ,IX,IY)
+         IF (NCELLY .GT. 1 .AND. NCELLX .GT. 1) THEN 
+            B (IZ,IX,IY) = B (IZ,IX,IY) + G%SHYIDTDMAY(IZ,IX,IY) 
+            AP(IZ,IX,IY) = AP(IZ,IX,IY) + G%SHYIAPY(IZ,IX,IY) / G%HPN(IZ,IX,IY)
+         ENDIF
+      ENDIF
+   
+      IF (BCSTOT(IZ,IX,IY) .GE. 0D0) THEN
+         G%SHP(IZ,IX,IY) = G%SHP(IZ,IX,IY) + BCSTOT(IZ,IX,IY)
+      ELSE
+         G%SHM(IZ,IX,IY) = G%SHM(IZ,IX,IY) - BCSTOT(IZ,IX,IY)
+      ENDIF
+
+      SNET(IZ,IX,IY) = G%SHP(IZ,IX,IY) - G%SHM(IZ,IX,IY)
+
+      IF (SNET(IZ,IX,IY) .GE. 0D0) THEN
+         B(IZ,IX,IY) = B(IZ,IX,IY) + SNET(IZ,IX,IY)*G%DXDYDZ(IZ,IX,IY)
+      ELSE
+         AP(IZ,IX,IY) = AP(IZ,IX,IY) - SNET(IZ,IX,IY)*G%DXDYDZ(IZ,IX,IY) / G%HPN(IZ,IX,IY)      
+      ENDIF
+
+      BSTART (IZ,IX,IY) = B (IZ,IX,IY)
+      APSTART(IZ,IX,IY) = AP(IZ,IX,IY)
+
+   ENDDO
+   ENDDO
+   ENDDO
+!$omp END PARALLEL DO
+ELSE
+!$omp PARALLEL DO SCHEDULE(STATIC)
+   DO IY = 1, NCELLY
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+      IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+
+      IF (BCSTOT(IZ,IX,IY) .GE. 0D0) THEN
+         G%SHP(IZ,IX,IY) = G%SHP(IZ,IX,IY) + BCSTOT(IZ,IX,IY)
+      ELSE
+         G%SHM(IZ,IX,IY) = G%SHM(IZ,IX,IY) - BCSTOT(IZ,IX,IY)
+      ENDIF
+
+      SNET(IZ,IX,IY) = G%SHP(IZ,IX,IY) - G%SHM(IZ,IX,IY)
+
+      IF (SNET(IZ,IX,IY) .GE. 0D0) THEN
+         B(IZ,IX,IY) = B(IZ,IX,IY) + SNET(IZ,IX,IY)*G%DXDYDZ(IZ,IX,IY)
+      ELSE
+         AP(IZ,IX,IY) = AP(IZ,IX,IY) - SNET(IZ,IX,IY)*G%DXDYDZ(IZ,IX,IY) / G%HPN(IZ,IX,IY)      
+      ENDIF
+
+      BSTART (IZ,IX,IY) = B (IZ,IX,IY)
+      APSTART(IZ,IX,IY) = AP(IZ,IX,IY)
+
+   ENDDO
+   ENDDO
+   ENDDO
+!$omp END PARALLEL DO
+ENDIF
+
+! Set BZ, BX, BY:
+IF (NCELLZ .GT. 1 .AND. NCELLX .GT. 1 .AND. NCELLY .EQ. 1) THEN !2D, sweep either in z or x
+
+   BY(:,:,:) = 0D0
+   IY = 1 
+   IF (SWEEPZ .AND. SWEEPX) THEN
+      DO IX = 1, NCELLX
+      DO IZ = 1, NCELLZ
+         BZ(IZ,IX,IY) = 0D0 ; BX (IZ,IX,IY) = 0D0
+         IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+         IF ((.NOT. G%NEEDSBCT(IZ,IX,IY)) .AND. IZ .NE. 1     ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AT(IZ,IX,IY)*G%HPN(IZ-1,IX,IY)
+         IF ((.NOT. G%NEEDSBCB(IZ,IX,IY)) .AND. IZ .NE. NCELLZ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AB(IZ,IX,IY)*G%HPN(IZ+1,IX,IY)
+         IF ((.NOT. G%NEEDSBCW(IZ,IX,IY)) .AND. IX .NE. 1     ) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AW(IZ,IX,IY)*G%HPN(IZ,IX-1,IY)
+         IF ((.NOT. G%NEEDSBCE(IZ,IX,IY)) .AND. IX .NE. NCELLX) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AE(IZ,IX,IY)*G%HPN(IZ,IX+1,IY)
+      ENDDO
+      ENDDO
+   ENDIF 
+
+   IF (SWEEPZ .AND. (.NOT. SWEEPX)) THEN
+      DO IX = 1, NCELLX
+      DO IZ = 1, NCELLZ
+         BX (IZ,IX,IY) = 0D0
+         IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+         IF ((.NOT. G%NEEDSBCW(IZ,IX,IY)) .AND. IX .NE. 1     ) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AW(IZ,IX,IY)*G%HPN(IZ,IX-1,IY)
+         IF ((.NOT. G%NEEDSBCE(IZ,IX,IY)) .AND. IX .NE. NCELLX) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AE(IZ,IX,IY)*G%HPN(IZ,IX+1,IY)
+      ENDDO
+      ENDDO
+   ENDIF 
+
+   IF ( SWEEPX .AND. (.NOT. SWEEPZ)) THEN
+      DO IX = 1, NCELLX
+      DO IZ = 1, NCELLZ
+         BZ(IZ,IX,IY) = 0D0
+         IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+         IF ((.NOT. G%NEEDSBCT(IZ,IX,IY)) .AND. IZ .NE. 1     ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AT(IZ,IX,IY)*G%HPN(IZ-1,IX,IY)
+         IF ((.NOT. G%NEEDSBCB(IZ,IX,IY)) .AND. IZ .NE. NCELLZ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AB(IZ,IX,IY)*G%HPN(IZ+1,IX,IY)
+      ENDDO
+      ENDDO
+   ENDIF
+
+ENDIF ! End section for 2D
+
+IF (NCELLZ .GT. 1 .AND. NCELLX .GT. 1 .AND. NCELLY .GT. 1) THEN !3D, sweep either in z or x or y
+
+   IF (SWEEPZ .AND. SWEEPX .AND. SWEEPY) THEN
+      DO IY = 1, NCELLY
+      DO IX = 1, NCELLX
+      DO IZ = 1, NCELLZ
+         BZ(IZ,IX,IY) = 0D0; BX(IZ,IX,IY) = 0D0; BY(IZ,IX,IY) = 0D0
+         IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+         IF ((.NOT. G%NEEDSBCT(IZ,IX,IY)) .AND. IZ .NE. 1     ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AT(IZ,IX,IY)*G%HPN(IZ-1,IX,IY)
+         IF ((.NOT. G%NEEDSBCB(IZ,IX,IY)) .AND. IZ .NE. NCELLZ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AB(IZ,IX,IY)*G%HPN(IZ+1,IX,IY)
+         IF ((.NOT. G%NEEDSBCW(IZ,IX,IY)) .AND. IX .NE. 1     ) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AW(IZ,IX,IY)*G%HPN(IZ,IX-1,IY)
+         IF ((.NOT. G%NEEDSBCE(IZ,IX,IY)) .AND. IX .NE. NCELLX) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AE(IZ,IX,IY)*G%HPN(IZ,IX+1,IY)
+         IF ((.NOT. G%NEEDSBCS(IZ,IX,IY)) .AND. IY .NE. 1     ) BY(IZ,IX,IY) = BY(IZ,IX,IY) + AS(IZ,IX,IY)*G%HPN(IZ,IX,IY-1)
+         IF ((.NOT. G%NEEDSBCN(IZ,IX,IY)) .AND. IY .NE. NCELLY) BY(IZ,IX,IY) = BY(IZ,IX,IY) + AN(IZ,IX,IY)*G%HPN(IZ,IX,IY+1)
+      ENDDO
+      ENDDO
+      ENDDO
+   ENDIF
+
+   IF (SWEEPZ .AND. (.NOT. SWEEPX) .AND. (.NOT. SWEEPY)) THEN
+      DO IY = 1, NCELLY
+      DO IX = 1, NCELLX
+      DO IZ = 1, NCELLZ
+         BX(IZ,IX,IY) = 0D0; BY(IZ,IX,IY) = 0D0
+         IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+         IF ((.NOT. G%NEEDSBCW(IZ,IX,IY)) .AND. IX .NE. 1     ) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AW(IZ,IX,IY)*G%HPN(IZ,IX-1,IY)
+         IF ((.NOT. G%NEEDSBCE(IZ,IX,IY)) .AND. IX .NE. NCELLX) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AE(IZ,IX,IY)*G%HPN(IZ,IX+1,IY)
+         IF ((.NOT. G%NEEDSBCS(IZ,IX,IY)) .AND. IY .NE. 1     ) BY(IZ,IX,IY) = BY(IZ,IX,IY) + AS(IZ,IX,IY)*G%HPN(IZ,IX,IY-1)
+         IF ((.NOT. G%NEEDSBCN(IZ,IX,IY)) .AND. IY .NE. NCELLY) BY(IZ,IX,IY) = BY(IZ,IX,IY) + AN(IZ,IX,IY)*G%HPN(IZ,IX,IY+1)
+      ENDDO
+      ENDDO
+      ENDDO
+   ENDIF
+
+   IF ((.NOT. SWEEPZ) .AND. SWEEPX .AND. (.NOT. SWEEPY)) THEN
+      DO IY = 1, NCELLY
+      DO IX = 1, NCELLX
+      DO IZ = 1, NCELLZ
+         BZ(IZ,IX,IY) = 0D0; BY(IZ,IX,IY) = 0D0
+         IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+         IF ((.NOT. G%NEEDSBCT(IZ,IX,IY)) .AND. IZ .NE. 1     ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AT(IZ,IX,IY)*G%HPN(IZ-1,IX,IY)
+         IF ((.NOT. G%NEEDSBCB(IZ,IX,IY)) .AND. IZ .NE. NCELLZ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AB(IZ,IX,IY)*G%HPN(IZ+1,IX,IY)
+         IF ((.NOT. G%NEEDSBCS(IZ,IX,IY)) .AND. IY .NE. 1     ) BY(IZ,IX,IY) = BY(IZ,IX,IY) + AS(IZ,IX,IY)*G%HPN(IZ,IX,IY-1)
+         IF ((.NOT. G%NEEDSBCN(IZ,IX,IY)) .AND. IY .NE. NCELLY) BY(IZ,IX,IY) = BY(IZ,IX,IY) + AN(IZ,IX,IY)*G%HPN(IZ,IX,IY+1)
+      ENDDO
+      ENDDO
+      ENDDO
+   ENDIF
+
+   IF ((.NOT. SWEEPZ) .AND. (.NOT. SWEEPX) .AND. SWEEPY) THEN
+      DO IY = 1, NCELLY
+      DO IX = 1, NCELLX
+      DO IZ = 1, NCELLZ
+         BZ(IZ,IX,IY) = 0D0; BX(IZ,IX,IY) = 0D0
+         IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+         IF ((.NOT. G%NEEDSBCT(IZ,IX,IY)) .AND. IZ .NE. 1     ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AT(IZ,IX,IY)*G%HPN(IZ-1,IX,IY)
+         IF ((.NOT. G%NEEDSBCB(IZ,IX,IY)) .AND. IZ .NE. NCELLZ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AB(IZ,IX,IY)*G%HPN(IZ+1,IX,IY)
+         IF ((.NOT. G%NEEDSBCW(IZ,IX,IY)) .AND. IX .NE. 1     ) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AW(IZ,IX,IY)*G%HPN(IZ,IX-1,IY)
+         IF ((.NOT. G%NEEDSBCE(IZ,IX,IY)) .AND. IX .NE. NCELLX) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AE(IZ,IX,IY)*G%HPN(IZ,IX+1,IY)
+      ENDDO
+      ENDDO
+      ENDDO
+   ENDIF
+
+ENDIF
+
+IF (SWEEPX) THEN
+   DO IZ = 1, NCELLZ
+   DO IY = 1, NCELLY
+      DO IX = 1, NCELLX
+         IF (G%IMASK(IZ,IX,IY) .NE. 0) THEN 
+           AP(IZ,IX,IY) = APSTART(IZ,IX,IY) / ALPHA_H
+           B (IZ,IX,IY) = BSTART (IZ,IX,IY) + BY (IZ,IX,IY) + BZ (IZ,IX,IY) + AP(IZ,IX,IY) * G%HPN(IZ,IX,IY) * (1D0 - ALPHA_H)
+         ENDIF
+     ENDDO
+      CALL TDMA_SOLVER_GENERAL(NCELLX,PTR(IZ,:,IY),AP(IZ,:,IY),AE(IZ,:,IY),AW(IZ,:,IY),B(IZ,:,IY))
+   ENDDO
+   ENDDO
+ENDIF ! End section for 3D
+
+IF (SWEEPY) THEN
+   DO IZ = 1, NCELLZ
+   DO IX = 1, NCELLX
+      DO IY = 1, NCELLY
+         IF (G%IMASK(IZ,IX,IY) .NE. 0) THEN 
+            AP(IZ,IX,IY) = APSTART(IZ,IX,IY) / ALPHA_H
+            B (IZ,IX,IY) = BSTART (IZ,IX,IY) + BX (IZ,IX,IY) + BZ (IZ,IX,IY) + AP(IZ,IX,IY) * G%HPN(IZ,IX,IY) * (1D0 - ALPHA_H) 
+         ENDIF
+      ENDDO
+      CALL TDMA_SOLVER_GENERAL(NCELLY,PTR(IZ,IX,:),AP(IZ,IX,:),AN(IZ,IX,:),AS(IZ,IX,:),B(IZ,IX,:))
+   ENDDO
+   ENDDO
+ENDIF
+
+IF (SWEEPZ) THEN 
+   DO IX = 1, NCELLX
+   DO IY = 1, NCELLY
+      DO IZ = 1, NCELLZ
+         IF (G%IMASK(IZ,IX,IY) .NE. 0) THEN 
+            AP(IZ,IX,IY) = APSTART(IZ,IX,IY) / ALPHA_H
+            B (IZ,IX,IY) = BSTART (IZ,IX,IY) + BX (IZ,IX,IY) + BY (IZ,IX,IY) + AP(IZ,IX,IY) * G%HPN(IZ,IX,IY) * (1D0 - ALPHA_H) 
+         ENDIF
+      ENDDO
+      CALL TDMA_SOLVER_GENERAL(NCELLZ,PTR(:,IX,IY),AP(:,IX,IY),AB(:,IX,IY),AT(:,IX,IY),B(:,IX,IY))
+      IF (PTR(1,1,1) .NE. PTR(1,1,1)) THEN
+         CONTINUE
+      ENDIF
+   ENDDO
+   ENDDO
+ENDIF
+
+CALL GET_CPU_TIME(TMID1)
+GPG%TUSED(1) = GPG%TUSED(1) + TMID1 - TSTART 
+
+! Parallelizing this loop causes the compiler to fail:
+!!$omp PARALLEL DO SCHEDULE(STATIC) PRIVATE(IZ,IX,IY,ISPEC,TGUESS,SUMYIC0I)
+DO IY = 1, NCELLY
+DO IX = 1, NCELLX
+DO IZ = 1, NCELLZ  !Calculate temperature from enthalpy
+   IF (G%HPN(IZ,IX,IY).NE.G%HPN(IZ,IX,IY) .OR. G%HPN(IZ,IX,IY).EQ.GPG%POSINF .OR. G%HPN(IZ,IX,IY).EQ.GPG%NEGINF) THEN
+      GPG%NAN = .TRUE.
+   ENDIF
+   IF (GPG%USE_TOFH_NEWTON) THEN
+      TGUESS = G%TP(IZ,IX,IY) + (G%HPN(IZ,IX,IY)-G%HP(IZ,IX,IY))/G%CPS(IZ,IX,IY)
+      G%TPN(IZ,IX,IY)= TOFH_NEWTON(G%HPN(IZ,IX,IY),TGUESS,SPROP%NSSPEC,G%YIN(:,IZ,IX,IY))
+   ELSE
+      SUMYIC0I = 0D0
+      DO ISPEC = 1, SPROP%NSSPEC
+         SUMYIC0I= SUMYIC0I + G%YIN(ISPEC,IZ,IX,IY)*SPROP%C0(ISPEC)
+      ENDDO
+      G%TPN(IZ,IX,IY) = GPG%TDATUM + G%HPN(IZ,IX,IY) / SUMYIC0I
+   ENDIF
+ENDDO
+ENDDO
+ENDDO
+!!$omp END PARALLEL DO
+
+CALL GET_CPU_TIME(TMID2)
+GPG%TUSED(2) = GPG%TUSED(2) + TMID2 - TMID1 
+
+!! Check convergence - RELATIVE TOLERANCE
+!!$omp PARALLEL DO SCHEDULE(STATIC)
+!DO IY = 1, NCELLY
+!DO IX = 1, NCELLX
+!DO IZ = 1, NCELLZ
+!   CONVERGED_TMP(IZ,IX,IY) = .TRUE.
+!   G%RESIDUAL_TMP(IZ,IX,IY) = REAL(G%IMASK(IZ,IX,IY))*ABS(G%TPN(IZ,IX,IY) - TPNOLD(IZ,IX,IY)) / MAX(EPS_T, ABS(TPNOLD(IZ,IX,IY) - GPG%TAMB))
+!   IF (G%RESIDUAL_TMP(IZ,IX,IY) .GT. GPG%TMPTOL*ALPHA_H) CONVERGED_TMP(IZ,IX,IY) = .FALSE. 
+!   IF (G%TPN(IZ,IX,IY).NE.G%TPN(IZ,IX,IY) .OR. G%TPN(IZ,IX,IY).EQ.GPG%POSINF .OR. G%TPN(IZ,IX,IY).EQ.GPG%NEGINF) THEN
+!      CONVERGED_TMP(IZ,IX,IY) = .FALSE.
+!      GPG%NAN = .TRUE.
+!   ENDIF
+!ENDDO
+!ENDDO
+!ENDDO
+!!$omp END PARALLEL DO
+
+! Check convergence - ABSOLUTE TOLERANCE
+!$omp PARALLEL DO SCHEDULE(STATIC)
+DO IY = 1, NCELLY
+DO IX = 1, NCELLX
+DO IZ = 1, NCELLZ
+   CONVERGED_TMP(IZ,IX,IY) = .TRUE.
+   G%RESIDUAL_TMP(IZ,IX,IY) = REAL(G%IMASK(IZ,IX,IY))*ABS(G%TPN(IZ,IX,IY) - TPNOLD(IZ,IX,IY))
+   IF (G%RESIDUAL_TMP(IZ,IX,IY) .GT. GPG%TMPTOL*ALPHA_H) CONVERGED_TMP(IZ,IX,IY) = .FALSE. 
+   IF (G%TPN(IZ,IX,IY).NE.G%TPN(IZ,IX,IY) .OR. G%TPN(IZ,IX,IY).EQ.GPG%POSINF .OR. G%TPN(IZ,IX,IY).EQ.GPG%NEGINF) THEN
+      CONVERGED_TMP(IZ,IX,IY) = .FALSE.
+      GPG%NAN = .TRUE.
+   ENDIF
+ENDDO
+ENDDO
+ENDDO
+!$omp END PARALLEL DO
+
+CALL GET_CPU_TIME(TEND)
+GPG%TUSED(1) = GPG%TUSED(1) + TEND - TMID2 
+
+! *****************************************************************************
+END SUBROUTINE SOLID_ENTHALPY_SOLVER
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE SOLID_ENTHALPY_SOLVER_TEST(NCELLZ,NCELLX,NCELLY,ITER,CONVERGED_TMP,ALPHA_H,DTIME)
+! *****************************************************************************
+
+INTEGER, INTENT(IN) :: NCELLX,NCELLY,NCELLZ,ITER
+REAL(EB), INTENT(IN) :: ALPHA_H,DTIME
+LOGICAL, INTENT(OUT) :: CONVERGED_TMP(1:NCELLZ,1:NCELLX,1:NCELLY)
+LOGICAL :: SWEEPZ, SWEEPX, SWEEPY
+INTEGER :: ISPEC,IZ,IX,IY
+REAL(EB) :: TSTART,TMID1,TMID2,TEND,TGUESS,SUMYIC0I,EMIS,QCONV
+REAL(EB), POINTER, DIMENSION(:,:,:) :: AP0,AP,AB,AT,AE,AW,AN,AS,B,TPNOLD,BCSTOT,PTR,BZ,BX,BY,BSTART,APSTART,SNET
+REAL(EB), PARAMETER :: EPS_T = 1.0
+
+CALL GET_CPU_TIME(TSTART)
+
+AP0     => G%RWORK01
+AP      => G%RWORK02
+AB      => G%RWORK03
+AT      => G%RWORK04
+AE      => G%RWORK05
+AW      => G%RWORK06
+AN      => G%RWORK07
+AS      => G%RWORK08
+B       => G%RWORK09
+TPNOLD  => G%RWORK10
+BCSTOT  => G%RWORK11
+PTR     => G%RWORK12
+BZ      => G%RWORK13
+BX      => G%RWORK14
+BY      => G%RWORK15
+BSTART  => G%RWORK16
+APSTART => G%RWORK17
+SNET    => G%RWORK18
+
+PTR => G%HPN
+
+! Vary sweep direction across iterations 
+SWEEPZ = .FALSE.
+SWEEPX = .FALSE. 
+SWEEPY = .FALSE. 
+
+IF (ITER .EQ. 1) THEN
+   IF (NCELLZ .GT. 1) SWEEPZ = .TRUE. 
+   IF (NCELLX .GT. 1) SWEEPX = .TRUE. 
+   IF (NCELLY .GT. 1) SWEEPY = .TRUE. 
+ELSE
+   IF (NCELLX .EQ. 1 .AND. NCELLY .EQ. 1) SWEEPZ = .TRUE. 
+
+   IF (NCELLX .GT. 1 .AND. NCELLY .EQ. 1) THEN
+      IF (MOD(ITER,2) .EQ. 0) THEN
+         SWEEPZ = .TRUE. 
+      ELSE
+         SWEEPX = .TRUE. 
+      ENDIF
+   ENDIF
+
+   IF (NCELLX .GT. 1 .AND. NCELLY .GT. 1) THEN
+      IF (MOD(ITER,3) .EQ. 2) SWEEPZ = .TRUE. 
+      IF (MOD(ITER,3) .EQ. 0) SWEEPX = .TRUE. 
+      IF (MOD(ITER,3) .EQ. 1) SWEEPY = .TRUE. 
+   ENDIF
+ENDIF
+
+! TEMPORARY, DELETE THIS:
+SWEEPZ=.TRUE.
+SWEEPX=.FALSE.
+SWEEPY=.FALSE.
+
+IF (NCELLZ .GT. 1 .AND. NCELLX .GT. 1 .AND. NCELLY .GT. 1 .AND. GPG%SWEEP_DIRECTION .NE. 'null') THEN
+
+! Set default:
+   IF (MOD(ITER,3) .EQ. 2) SWEEPZ = .TRUE. 
+   IF (MOD(ITER,3) .EQ. 0) SWEEPX = .TRUE. 
+   IF (MOD(ITER,3) .EQ. 1) SWEEPY = .TRUE. 
+
+   IF (TRIM(GPG%SWEEP_DIRECTION) .EQ. 'x') THEN
+      SWEEPZ = .FALSE. 
+      SWEEPX = .TRUE. 
+      SWEEPY = .FALSE.
+   ENDIF
+
+   IF (TRIM(GPG%SWEEP_DIRECTION) .EQ. 'y') THEN
+      SWEEPZ = .FALSE. 
+      SWEEPX = .FALSE. 
+      SWEEPY = .TRUE.
+   ENDIF
+
+   IF (TRIM(GPG%SWEEP_DIRECTION) .EQ. 'z') THEN
+      SWEEPZ = .TRUE. 
+      SWEEPX = .FALSE. 
+      SWEEPY = .FALSE.
+   ENDIF
+
+   IF (TRIM(GPG%SWEEP_DIRECTION) .EQ. 'xy') THEN
+      SWEEPZ = .FALSE. 
+      SWEEPX = .TRUE. 
+      SWEEPY = .TRUE.
+   ENDIF
+
+   IF (TRIM(GPG%SWEEP_DIRECTION) .EQ. 'xz') THEN
+      SWEEPZ = .TRUE. 
+      SWEEPX = .TRUE. 
+      SWEEPY = .FALSE.
+   ENDIF
+
+   IF (TRIM(GPG%SWEEP_DIRECTION) .EQ. 'yz') THEN
+      SWEEPZ = .TRUE. 
+      SWEEPX = .FALSE. 
+      SWEEPY = .TRUE.
+   ENDIF
+
+   IF (TRIM(GPG%SWEEP_DIRECTION) .EQ. 'xyz') THEN
+      SWEEPZ = .TRUE. 
+      SWEEPX = .TRUE. 
+      SWEEPY = .TRUE.
+   ENDIF
+
+ENDIF
+
+! Specify coefficients for TDMA:
+
+IF (NCELLZ .GT. 1 .AND. NCELLX .EQ. 1 .AND. NCELLY .EQ. 1) THEN
+!$omp PARALLEL DO SCHEDULE(STATIC)
+   DO IY = 1, NCELLY
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+      TPNOLD (IZ,IX,IY) = G%TPN(IZ,IX,IY)
+      IF (G%IMASK(IZ,IX,IY) .NE. 0) THEN
+         AP0(IZ,IX,IY) = G%RDLTZ(IZ,IX,IY) * G%DXDY(IZ,IX,IY) / DTIME
+         B  (IZ,IX,IY) = AP0(IZ,IX,IY) * G%HP(IZ,IX,IY)
+         AB (IZ,IX,IY) = G%KOCB(IZ,IX,IY) * G%DXDY(IZ,IX,IY) / G%DZB(IZ,IX,IY)
+         AT (IZ,IX,IY) = G%KOCT(IZ,IX,IY) * G%DXDY(IZ,IX,IY) / G%DZT(IZ,IX,IY)
+         AP (IZ,IX,IY) = AP0(IZ,IX,IY) + AB(IZ,IX,IY) + AT(IZ,IX,IY)
+      ELSE
+         B  (IZ,IX,IY) = G%HP(IZ,IX,IY)
+         AP (IZ,IX,IY) = 1D0
+         AT (IZ,IX,IY) = 0D0
+         AB (IZ,IX,IY) = 0D0
+      ENDIF
+   ENDDO
+   ENDDO
+   ENDDO
+!$omp END PARALLEL DO
+ENDIF
+
+IF (NCELLZ .GT. 1 .AND. NCELLX .GT. 1 .AND. NCELLY .EQ. 1) THEN
+!$omp PARALLEL DO SCHEDULE(STATIC)
+   DO IY = 1, NCELLY
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+      TPNOLD (IZ,IX,IY) = G%TPN(IZ,IX,IY)
+      IF (G%IMASK(IZ,IX,IY) .NE. 0) THEN
+         AP0(IZ,IX,IY) = G%RDLTZ(IZ,IX,IY) * G%DXDY(IZ,IX,IY) / DTIME
+         B  (IZ,IX,IY) = AP0(IZ,IX,IY) * G%HP(IZ,IX,IY)
+         AB (IZ,IX,IY) = G%KOCB(IZ,IX,IY) * G%DXDY(IZ,IX,IY) / G%DZB(IZ,IX,IY)
+         AT (IZ,IX,IY) = G%KOCT(IZ,IX,IY) * G%DXDY(IZ,IX,IY) / G%DZT(IZ,IX,IY)
+         AE (IZ,IX,IY) = G%KOCE(IZ,IX,IY) * G%DYDZ(IZ,IX,IY) / G%DXE(IZ,IX,IY)
+         AW (IZ,IX,IY) = G%KOCW(IZ,IX,IY) * G%DYDZ(IZ,IX,IY) / G%DXW(IZ,IX,IY)
+         AP (IZ,IX,IY) = AP0(IZ,IX,IY) + AB(IZ,IX,IY) + AT(IZ,IX,IY) + AE(IZ,IX,IY) + AW(IZ,IX,IY)
+      ELSE
+         B  (IZ,IX,IY) = G%HP(IZ,IX,IY)
+         AP (IZ,IX,IY) = 1D0
+         AT (IZ,IX,IY) = 0D0
+         AB (IZ,IX,IY) = 0D0
+         AE (IZ,IX,IY) = 0D0
+         AW (IZ,IX,IY) = 0D0
+      ENDIF
+   ENDDO
+   ENDDO
+   ENDDO
+!$omp END PARALLEL DO
+ENDIF
+
+IF (NCELLZ .GT. 1 .AND. NCELLX .GT. 1 .AND. NCELLY .GT. 1) THEN
+!$omp PARALLEL DO SCHEDULE(DYNAMIC,4)
+   DO IY = 1, NCELLY
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+      TPNOLD (IZ,IX,IY) = G%TPN(IZ,IX,IY)
+      IF (G%IMASK(IZ,IX,IY) .NE. 0) THEN
+         AP0(IZ,IX,IY) = G%RDLTZ(IZ,IX,IY) * G%DXDY(IZ,IX,IY) / DTIME
+         B  (IZ,IX,IY) = AP0(IZ,IX,IY) * G%HP(IZ,IX,IY)
+         AB (IZ,IX,IY) = G%KOCB(IZ,IX,IY) * G%DXDY(IZ,IX,IY) / G%DZB(IZ,IX,IY)
+         AT (IZ,IX,IY) = G%KOCT(IZ,IX,IY) * G%DXDY(IZ,IX,IY) / G%DZT(IZ,IX,IY)
+         AE (IZ,IX,IY) = G%KOCE(IZ,IX,IY) * G%DYDZ(IZ,IX,IY) / G%DXE(IZ,IX,IY)
+         AW (IZ,IX,IY) = G%KOCW(IZ,IX,IY) * G%DYDZ(IZ,IX,IY) / G%DXW(IZ,IX,IY)
+         AN (IZ,IX,IY) = G%KOCN(IZ,IX,IY) * G%DXDZ(IZ,IX,IY) / G%DYN(IZ,IX,IY)
+         AS (IZ,IX,IY) = G%KOCS(IZ,IX,IY) * G%DXDZ(IZ,IX,IY) / G%DYS(IZ,IX,IY)
+         AP (IZ,IX,IY) = AP0(IZ,IX,IY) + AB(IZ,IX,IY) + AT(IZ,IX,IY) + AE(IZ,IX,IY) + AW(IZ,IX,IY) + AN(IZ,IX,IY) + AS(IZ,IX,IY)
+      ELSE
+         B  (IZ,IX,IY) = G%HP(IZ,IX,IY)
+         AP (IZ,IX,IY) = 1D0
+         AT (IZ,IX,IY) = 0D0
+         AB (IZ,IX,IY) = 0D0
+         AE (IZ,IX,IY) = 0D0
+         AW (IZ,IX,IY) = 0D0
+         AS (IZ,IX,IY) = 0D0
+         AN (IZ,IX,IY) = 0D0
+      ENDIF
+   ENDDO
+   ENDDO
+   ENDDO
+!$omp END PARALLEL DO
+ENDIF
+
+! Set boundary conditions:
+IF (NCELLZ .GT. 1 .AND. NCELLX .EQ. 1 .AND. NCELLY .EQ. 1) THEN
+   IX = 1
+   IY = 1
+!$omp PARALLEL DO SCHEDULE(STATIC) PRIVATE(QCONV,EMIS,ISPEC)
+   DO IZ = 1, NCELLZ
+      BCSTOT(IZ,IX,IY) = 0D0
+
+      IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+
+      IF (G%NEEDSBCT(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY,-3)%TFIXED .LT. 0D0) THEN         
+             QCONV = GPBCP(IZ,IX,IY,-3)%HC0 * (GPBCP(IZ,IX,IY,-3)%TINF - G%TPN(IZ,IX,IY)) 
+             EMIS  = CALC_EMIS(IZ,IX,IY)
+             GPBCP(IZ,IX,IY,-3)%QENET = EMIS * GPBCP(IZ,IX,IY,-3)%QE
+             IF (GPBCP(IZ,IX,IY,-3)%RERAD) GPBCP(IZ,IX,IY,-3)%QENET = GPBCP(IZ,IX,IY,-3)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY,-3)%TINF**4D0)
+             BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + (QCONV + GPBCP(IZ,IX,IY,-3)%QENET) / G%DLTZN(IZ,IX,IY)
+          ELSE
+             GPBCP(IZ,IX,IY,-3)%HFIXED = 0D0
+             DO ISPEC = 1, SPROP%NSSPEC
+                GPBCP(IZ,IX,IY,-3)%HFIXED = GPBCP(IZ,IX,IY,-3)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY,-3)%TFIXED)
+             ENDDO
+             CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY,-3)%HFIXED)
+          ENDIF
+       ENDIF
+
+      IF (G%NEEDSBCB(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY, 3)%TFIXED .LT. 0D0) THEN         
+            QCONV = GPBCP(IZ,IX,IY, 3)%HC0 * (GPBCP(IZ,IX,IY, 3)%TINF - G%TPN(IZ,IX,IY)) 
+            EMIS  = CALC_EMIS(IZ,IX,IY)
+            GPBCP(IZ,IX,IY, 3)%QENET = EMIS * GPBCP(IZ,IX,IY, 3)%QE
+            IF (GPBCP(IZ,IX,IY, 3)%RERAD) GPBCP(IZ,IX,IY, 3)%QENET = GPBCP(IZ,IX,IY, 3)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY, 3)%TINF**4D0)
+            BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + (QCONV + GPBCP(IZ,IX,IY, 3)%QENET) / G%DLTZN(IZ,IX,IY)
+         ELSE
+            GPBCP(IZ,IX,IY, 3)%HFIXED = 0D0
+            DO ISPEC = 1, SPROP%NSSPEC
+               GPBCP(IZ,IX,IY, 3)%HFIXED = GPBCP(IZ,IX,IY, 3)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY, 3)%TFIXED)
+            ENDDO
+            CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY, 3)%HFIXED)
+         ENDIF
+      ENDIF
+   ENDDO
+!$omp END PARALLEL DO
+ENDIF ! End of 1D section
+
+IF (NCELLZ .GT. 1 .AND. NCELLX .GT. 1 .AND. NCELLY .EQ. 1) THEN
+   IY = 1
+
+!$omp PARALLEL DO SCHEDULE(STATIC) PRIVATE(QCONV,EMIS,ISPEC)
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+
+      BCSTOT(IZ,IX,IY) = 0D0
+
+      IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+
+      IF (G%NEEDSBCT(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY,-3)%TFIXED .LT. 0D0) THEN         
+             QCONV = GPBCP(IZ,IX,IY,-3)%HC0 * (GPBCP(IZ,IX,IY,-3)%TINF - G%TPN(IZ,IX,IY)) 
+             EMIS  = CALC_EMIS(IZ,IX,IY)
+             GPBCP(IZ,IX,IY,-3)%QENET = EMIS * GPBCP(IZ,IX,IY,-3)%QE
+             IF (GPBCP(IZ,IX,IY,-3)%RERAD) GPBCP(IZ,IX,IY,-3)%QENET = GPBCP(IZ,IX,IY,-3)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY,-3)%TINF**4D0)
+             BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + (QCONV + GPBCP(IZ,IX,IY,-3)%QENET) / G%DLTZN(IZ,IX,IY)
+          ELSE
+             GPBCP(IZ,IX,IY,-3)%HFIXED = 0D0
+             DO ISPEC = 1, SPROP%NSSPEC
+                GPBCP(IZ,IX,IY,-3)%HFIXED = GPBCP(IZ,IX,IY,-3)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY,-3)%TFIXED)
+             ENDDO
+             CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY,-3)%HFIXED)
+          ENDIF
+       ENDIF
+
+      IF (G%NEEDSBCB(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY, 3)%TFIXED .LT. 0D0) THEN         
+            QCONV = GPBCP(IZ,IX,IY, 3)%HC0 * (GPBCP(IZ,IX,IY, 3)%TINF - G%TPN(IZ,IX,IY)) 
+            EMIS  = CALC_EMIS(IZ,IX,IY)
+            GPBCP(IZ,IX,IY, 3)%QENET = EMIS * GPBCP(IZ,IX,IY, 3)%QE
+            IF (GPBCP(IZ,IX,IY, 3)%RERAD) GPBCP(IZ,IX,IY, 3)%QENET = GPBCP(IZ,IX,IY, 3)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY, 3)%TINF**4D0)
+            BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + (QCONV + GPBCP(IZ,IX,IY, 3)%QENET) / G%DLTZN(IZ,IX,IY)
+         ELSE
+            GPBCP(IZ,IX,IY, 3)%HFIXED = 0D0
+            DO ISPEC = 1, SPROP%NSSPEC
+               GPBCP(IZ,IX,IY, 3)%HFIXED = GPBCP(IZ,IX,IY, 3)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY, 3)%TFIXED)
+            ENDDO
+            CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY, 3)%HFIXED)
+         ENDIF
+      ENDIF
+
+      IF (G%NEEDSBCW(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY,-1)%TFIXED .LT. 0D0) THEN         
+            QCONV = GPBCP(IZ,IX,IY,-1)%HC0 * (GPBCP(IZ,IX,IY,-1)%TINF - G%TPN(IZ,IX,IY)) 
+            EMIS  = CALC_EMIS(IZ,IX,IY)
+            GPBCP(IZ,IX,IY,-1)%QENET = EMIS * GPBCP(IZ,IX,IY,-1)%QE
+            IF (GPBCP(IZ,IX,IY,-1)%RERAD) GPBCP(IZ,IX,IY,-1)%QENET = GPBCP(IZ,IX,IY,-1)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY,-1)%TINF**4D0)
+            BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + (QCONV + GPBCP(IZ,IX,IY,-1)%QENET) / G%DLTXN(IZ,IX,IY)
+         ELSE
+            GPBCP(IZ,IX,IY,-1)%HFIXED = 0D0
+            DO ISPEC = 1, SPROP%NSSPEC
+               GPBCP(IZ,IX,IY,-1)%HFIXED = GPBCP(IZ,IX,IY,-1)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY,-1)%TFIXED)
+            ENDDO
+            CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY,-1)%HFIXED)
+         ENDIF
+      ENDIF
+
+      IF (G%NEEDSBCE(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY,1)%TFIXED .LT. 0D0) THEN         
+            QCONV = GPBCP(IZ,IX,IY, 1)%HC0 * (GPBCP(IZ,IX,IY,1)%TINF - G%TPN(IZ,IX,IY)) 
+            EMIS  = CALC_EMIS(IZ,IX,IY)
+            GPBCP(IZ,IX,IY, 1)%QENET = EMIS * GPBCP(IZ,IX,IY, 1)%QE
+            IF (GPBCP(IZ,IX,IY, 1)%RERAD) GPBCP(IZ,IX,IY, 1)%QENET = GPBCP(IZ,IX,IY, 1)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY, 1)%TINF**4D0)
+            BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + (QCONV + GPBCP(IZ,IX,IY, 1)%QENET) / G%DLTXN(IZ,IX,IY)
+         ELSE
+            GPBCP(IZ,IX,IY, 1)%HFIXED = 0D0
+            DO ISPEC = 1, SPROP%NSSPEC
+               GPBCP(IZ,IX,IY, 1)%HFIXED = GPBCP(IZ,IX,IY, 1)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY, 1)%TFIXED)
+            ENDDO
+            CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY, 1)%HFIXED)
+         ENDIF
+      ENDIF
+
+   ENDDO
+   ENDDO
+!$omp END PARALLEL DO
+ENDIF !End of 2D section
+
+IF (NCELLZ .GT. 1 .AND. NCELLX .GT. 1 .AND. NCELLY .GT. 1) THEN
+!$omp PARALLEL DO SCHEDULE(STATIC) PRIVATE(QCONV,EMIS,ISPEC)
+   DO IY = 1, NCELLY
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+
+      BCSTOT(IZ,IX,IY) = 0D0
+
+      IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+
+      IF (G%NEEDSBCT(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY,-3)%TFIXED .LT. 0D0) THEN         
+             QCONV = GPBCP(IZ,IX,IY,-3)%HC0 * (GPBCP(IZ,IX,IY,-3)%TINF - G%TPN(IZ,IX,IY)) 
+             EMIS  = CALC_EMIS(IZ,IX,IY)
+             GPBCP(IZ,IX,IY,-3)%QENET = EMIS * GPBCP(IZ,IX,IY,-3)%QE
+             IF (GPBCP(IZ,IX,IY,-3)%RERAD) GPBCP(IZ,IX,IY,-3)%QENET = GPBCP(IZ,IX,IY,-3)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY,-3)%TINF**4D0)
+             BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + (QCONV + GPBCP(IZ,IX,IY,-3)%QENET) / G%DLTZN(IZ,IX,IY)
+          ELSE
+             GPBCP(IZ,IX,IY,-3)%HFIXED = 0D0
+             DO ISPEC = 1, SPROP%NSSPEC
+                GPBCP(IZ,IX,IY,-3)%HFIXED = GPBCP(IZ,IX,IY,-3)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY,-3)%TFIXED)
+             ENDDO
+             CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY,-3)%HFIXED)
+          ENDIF
+       ENDIF
+
+      IF (G%NEEDSBCB(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY, 3)%TFIXED .LT. 0D0) THEN         
+            QCONV = GPBCP(IZ,IX,IY, 3)%HC0 * (GPBCP(IZ,IX,IY, 3)%TINF - G%TPN(IZ,IX,IY)) 
+            EMIS  = CALC_EMIS(IZ,IX,IY)
+            GPBCP(IZ,IX,IY, 3)%QENET = EMIS * GPBCP(IZ,IX,IY, 3)%QE
+            IF (GPBCP(IZ,IX,IY, 3)%RERAD) GPBCP(IZ,IX,IY, 3)%QENET = GPBCP(IZ,IX,IY, 3)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY, 3)%TINF**4D0)
+            BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + (QCONV + GPBCP(IZ,IX,IY, 3)%QENET) / G%DLTZN(IZ,IX,IY)
+         ELSE
+            GPBCP(IZ,IX,IY, 3)%HFIXED = 0D0
+            DO ISPEC = 1, SPROP%NSSPEC
+               GPBCP(IZ,IX,IY, 3)%HFIXED = GPBCP(IZ,IX,IY, 3)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY, 3)%TFIXED)
+            ENDDO
+            CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY, 3)%HFIXED)
+         ENDIF
+      ENDIF
+
+      IF (G%NEEDSBCW(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY,-1)%TFIXED .LT. 0D0) THEN         
+            QCONV = GPBCP(IZ,IX,IY,-1)%HC0 * (GPBCP(IZ,IX,IY,-1)%TINF - G%TPN(IZ,IX,IY)) 
+            EMIS  = CALC_EMIS(IZ,IX,IY)
+            GPBCP(IZ,IX,IY,-1)%QENET = EMIS * GPBCP(IZ,IX,IY,-1)%QE
+            IF (GPBCP(IZ,IX,IY,-1)%RERAD) GPBCP(IZ,IX,IY,-1)%QENET = GPBCP(IZ,IX,IY,-1)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY,-1)%TINF**4D0)
+            BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + (QCONV + GPBCP(IZ,IX,IY,-1)%QENET) / G%DLTXN(IZ,IX,IY)
+         ELSE
+            GPBCP(IZ,IX,IY,-1)%HFIXED = 0D0
+            DO ISPEC = 1, SPROP%NSSPEC
+               GPBCP(IZ,IX,IY,-1)%HFIXED = GPBCP(IZ,IX,IY,-1)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY,-1)%TFIXED)
+            ENDDO
+            CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY,-1)%HFIXED)
+         ENDIF
+      ENDIF
+
+      IF (G%NEEDSBCE(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY,1)%TFIXED .LT. 0D0) THEN         
+            QCONV = GPBCP(IZ,IX,IY, 1)%HC0 * (GPBCP(IZ,IX,IY,1)%TINF - G%TPN(IZ,IX,IY)) 
+            EMIS  = CALC_EMIS(IZ,IX,IY)
+            GPBCP(IZ,IX,IY, 1)%QENET = EMIS * GPBCP(IZ,IX,IY, 1)%QE
+            IF (GPBCP(IZ,IX,IY, 1)%RERAD) GPBCP(IZ,IX,IY, 1)%QENET = GPBCP(IZ,IX,IY, 1)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY, 1)%TINF**4D0)
+            BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + (QCONV + GPBCP(IZ,IX,IY, 1)%QENET) / G%DLTXN(IZ,IX,IY)
+         ELSE
+            GPBCP(IZ,IX,IY, 1)%HFIXED = 0D0
+            DO ISPEC = 1, SPROP%NSSPEC
+               GPBCP(IZ,IX,IY, 1)%HFIXED = GPBCP(IZ,IX,IY, 1)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY, 1)%TFIXED)
+            ENDDO
+            CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY, 1)%HFIXED)
+         ENDIF
+      ENDIF
+
+      IF (G%NEEDSBCS(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY,-2)%TFIXED .LT. 0D0) THEN
+            QCONV = GPBCP(IZ,IX,IY,-2)%HC0 * (GPBCP(IZ,IX,IY,-2)%TINF - G%TPN(IZ,IX,IY)) 
+            EMIS  = CALC_EMIS(IZ,IX,IY)
+            GPBCP(IZ,IX,IY,-2)%QENET = EMIS * GPBCP(IZ,IX,IY,-2)%QE
+            IF (GPBCP(IZ,IX,IY,-2)%RERAD) GPBCP(IZ,IX,IY,-2)%QENET = GPBCP(IZ,IX,IY,-2)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY,-2)%TINF**4D0)
+            BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + (QCONV + GPBCP(IZ,IX,IY,-2)%QENET) / G%DLTYN(IZ,IX,IY)
+         ELSE
+            GPBCP(IZ,IX,IY,-2)%HFIXED = 0D0
+            DO ISPEC = 1, SPROP%NSSPEC
+               GPBCP(IZ,IX,IY,-2)%HFIXED = GPBCP(IZ,IX,IY,-2)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY,-2)%TFIXED)
+            ENDDO
+            CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY,-2)%HFIXED)
+         ENDIF
+      ENDIF
+
+      IF (G%NEEDSBCN(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY, 2)%TFIXED .LT. 0D0) THEN
+            QCONV = GPBCP(IZ,IX,IY, 2)%HC0 * (GPBCP(IZ,IX,IY, 2)%TINF - G%TPN(IZ,IX,IY)) 
+            EMIS  = CALC_EMIS(IZ,IX,IY)
+            GPBCP(IZ,IX,IY, 2)%QENET = EMIS * GPBCP(IZ,IX,IY, 2)%QE
+            IF (GPBCP(IZ,IX,IY, 2)%RERAD) GPBCP(IZ,IX,IY, 2)%QENET = GPBCP(IZ,IX,IY, 2)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY, 2)%TINF**4D0)
+            BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + (QCONV + GPBCP(IZ,IX,IY, 2)%QENET) / G%DLTYN(IZ,IX,IY)
+         ELSE
+            GPBCP(IZ,IX,IY, 2)%HFIXED = 0D0
+            DO ISPEC = 1, SPROP%NSSPEC
+               GPBCP(IZ,IX,IY, 2)%HFIXED = GPBCP(IZ,IX,IY, 2)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY, 2)%TFIXED)
+            ENDDO
+            CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY, 2)%HFIXED)
+         ENDIF
+      ENDIF
+
+   ENDDO
+   ENDDO
+   ENDDO
+!$omp END PARALLEL DO
+ENDIF !End of 3D section
+
+IF (GPG%SHYI_CORRECTION) THEN
+
+!$omp PARALLEL DO SCHEDULE(STATIC)
+   DO IY = 1, NCELLY
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+      IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+      B (IZ,IX,IY) = B (IZ,IX,IY) + G%SHYIDTDMAZ(IZ,IX,IY) 
+      AP(IZ,IX,IY) = AP(IZ,IX,IY) + G%SHYIAPZ(IZ,IX,IY) / G%HPN(IZ,IX,IY)
+   
+      IF (NCELLX .GT. 1) THEN 
+         B (IZ,IX,IY) = B (IZ,IX,IY) + G%SHYIDTDMAX(IZ,IX,IY) 
+         AP(IZ,IX,IY) = AP(IZ,IX,IY) + G%SHYIAPX(IZ,IX,IY) / G%HPN(IZ,IX,IY)
+         IF (NCELLY .GT. 1 .AND. NCELLX .GT. 1) THEN 
+            B (IZ,IX,IY) = B (IZ,IX,IY) + G%SHYIDTDMAY(IZ,IX,IY) 
+            AP(IZ,IX,IY) = AP(IZ,IX,IY) + G%SHYIAPY(IZ,IX,IY) / G%HPN(IZ,IX,IY)
+         ENDIF
+      ENDIF
+   
+      IF (BCSTOT(IZ,IX,IY) .GE. 0D0) THEN
+         G%SHP(IZ,IX,IY) = G%SHP(IZ,IX,IY) + BCSTOT(IZ,IX,IY)
+      ELSE
+         G%SHM(IZ,IX,IY) = G%SHM(IZ,IX,IY) - BCSTOT(IZ,IX,IY)
+      ENDIF
+
+      SNET(IZ,IX,IY) = G%SHP(IZ,IX,IY) - G%SHM(IZ,IX,IY)
+
+      IF (SNET(IZ,IX,IY) .GE. 0D0) THEN
+         B(IZ,IX,IY) = B(IZ,IX,IY) + SNET(IZ,IX,IY)*G%DXDYDZ(IZ,IX,IY)
+      ELSE
+         AP(IZ,IX,IY) = AP(IZ,IX,IY) - SNET(IZ,IX,IY)*G%DXDYDZ(IZ,IX,IY) / G%HPN(IZ,IX,IY)      
+      ENDIF
+
+      BSTART (IZ,IX,IY) = B (IZ,IX,IY)
+      APSTART(IZ,IX,IY) = AP(IZ,IX,IY)
+
+   ENDDO
+   ENDDO
+   ENDDO
+!$omp END PARALLEL DO
+ELSE
+!$omp PARALLEL DO SCHEDULE(STATIC)
+   DO IY = 1, NCELLY
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+      IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+
+      IF (BCSTOT(IZ,IX,IY) .GE. 0D0) THEN
+         G%SHP(IZ,IX,IY) = G%SHP(IZ,IX,IY) + BCSTOT(IZ,IX,IY)
+      ELSE
+         G%SHM(IZ,IX,IY) = G%SHM(IZ,IX,IY) - BCSTOT(IZ,IX,IY)
+      ENDIF
+
+      SNET(IZ,IX,IY) = G%SHP(IZ,IX,IY) - G%SHM(IZ,IX,IY)
+
+      IF (SNET(IZ,IX,IY) .GE. 0D0) THEN
+         B(IZ,IX,IY) = B(IZ,IX,IY) + SNET(IZ,IX,IY)*G%DXDYDZ(IZ,IX,IY)
+      ELSE
+         AP(IZ,IX,IY) = AP(IZ,IX,IY) - SNET(IZ,IX,IY)*G%DXDYDZ(IZ,IX,IY) / G%HPN(IZ,IX,IY)      
+      ENDIF
+
+      BSTART (IZ,IX,IY) = B (IZ,IX,IY)
+      APSTART(IZ,IX,IY) = AP(IZ,IX,IY)
+
+   ENDDO
+   ENDDO
+   ENDDO
+!$omp END PARALLEL DO
+ENDIF
+
+! Set BZ, BX, BY:
+IF (NCELLZ .GT. 1 .AND. NCELLX .GT. 1 .AND. NCELLY .EQ. 1) THEN !2D, sweep either in z or x
+
+   BY(:,:,:) = 0D0
+   IY = 1 
+   IF (SWEEPZ .AND. SWEEPX) THEN
+      DO IX = 1, NCELLX
+      DO IZ = 1, NCELLZ
+         BZ(IZ,IX,IY) = 0D0 ; BX (IZ,IX,IY) = 0D0
+         IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+         IF ((.NOT. G%NEEDSBCT(IZ,IX,IY)) .AND. IZ .NE. 1     ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AT(IZ,IX,IY)*G%HPN(IZ-1,IX,IY)
+         IF ((.NOT. G%NEEDSBCB(IZ,IX,IY)) .AND. IZ .NE. NCELLZ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AB(IZ,IX,IY)*G%HPN(IZ+1,IX,IY)
+         IF ((.NOT. G%NEEDSBCW(IZ,IX,IY)) .AND. IX .NE. 1     ) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AW(IZ,IX,IY)*G%HPN(IZ,IX-1,IY)
+         IF ((.NOT. G%NEEDSBCE(IZ,IX,IY)) .AND. IX .NE. NCELLX) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AE(IZ,IX,IY)*G%HPN(IZ,IX+1,IY)
+      ENDDO
+      ENDDO
+   ENDIF 
+
+   IF (SWEEPZ .AND. (.NOT. SWEEPX)) THEN
+      DO IX = 1, NCELLX
+      DO IZ = 1, NCELLZ
+         BX (IZ,IX,IY) = 0D0
+         IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+         IF ((.NOT. G%NEEDSBCW(IZ,IX,IY)) .AND. IX .NE. 1     ) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AW(IZ,IX,IY)*G%HPN(IZ,IX-1,IY)
+         IF ((.NOT. G%NEEDSBCE(IZ,IX,IY)) .AND. IX .NE. NCELLX) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AE(IZ,IX,IY)*G%HPN(IZ,IX+1,IY)
+      ENDDO
+      ENDDO
+   ENDIF 
+
+   IF ( SWEEPX .AND. (.NOT. SWEEPZ)) THEN
+      DO IX = 1, NCELLX
+      DO IZ = 1, NCELLZ
+         BZ(IZ,IX,IY) = 0D0
+         IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+         IF ((.NOT. G%NEEDSBCT(IZ,IX,IY)) .AND. IZ .NE. 1     ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AT(IZ,IX,IY)*G%HPN(IZ-1,IX,IY)
+         IF ((.NOT. G%NEEDSBCB(IZ,IX,IY)) .AND. IZ .NE. NCELLZ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AB(IZ,IX,IY)*G%HPN(IZ+1,IX,IY)
+      ENDDO
+      ENDDO
+   ENDIF
+
+ENDIF ! End section for 2D
+
+!IF (NCELLZ .GT. 1 .AND. NCELLX .GT. 1 .AND. NCELLY .GT. 1) THEN !3D, sweep either in z or x or y
+!
+!   IF (SWEEPZ .AND. SWEEPX .AND. SWEEPY) THEN
+!      DO IY = 1, NCELLY
+!      DO IX = 1, NCELLX
+!      DO IZ = 1, NCELLZ
+!         BZ(IZ,IX,IY) = 0D0; BX(IZ,IX,IY) = 0D0; BY(IZ,IX,IY) = 0D0
+!         IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+!         IF ((.NOT. G%NEEDSBCT(IZ,IX,IY)) .AND. IZ .NE. 1     ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AT(IZ,IX,IY)*G%HPN(IZ-1,IX,IY)
+!         IF ((.NOT. G%NEEDSBCB(IZ,IX,IY)) .AND. IZ .NE. NCELLZ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AB(IZ,IX,IY)*G%HPN(IZ+1,IX,IY)
+!         IF ((.NOT. G%NEEDSBCW(IZ,IX,IY)) .AND. IX .NE. 1     ) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AW(IZ,IX,IY)*G%HPN(IZ,IX-1,IY)
+!         IF ((.NOT. G%NEEDSBCE(IZ,IX,IY)) .AND. IX .NE. NCELLX) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AE(IZ,IX,IY)*G%HPN(IZ,IX+1,IY)
+!         IF ((.NOT. G%NEEDSBCS(IZ,IX,IY)) .AND. IY .NE. 1     ) BY(IZ,IX,IY) = BY(IZ,IX,IY) + AS(IZ,IX,IY)*G%HPN(IZ,IX,IY-1)
+!         IF ((.NOT. G%NEEDSBCN(IZ,IX,IY)) .AND. IY .NE. NCELLY) BY(IZ,IX,IY) = BY(IZ,IX,IY) + AN(IZ,IX,IY)*G%HPN(IZ,IX,IY+1)
+!      ENDDO
+!      ENDDO
+!      ENDDO
+!   ENDIF
+!
+!   IF (SWEEPZ .AND. (.NOT. SWEEPX) .AND. (.NOT. SWEEPY)) THEN
+!      DO IY = 1, NCELLY
+!      DO IX = 1, NCELLX
+!      DO IZ = 1, NCELLZ
+!         BX(IZ,IX,IY) = 0D0; BY(IZ,IX,IY) = 0D0
+!         IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+!         IF ((.NOT. G%NEEDSBCW(IZ,IX,IY)) .AND. IX .NE. 1     ) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AW(IZ,IX,IY)*G%HPN(IZ,IX-1,IY)
+!         IF ((.NOT. G%NEEDSBCE(IZ,IX,IY)) .AND. IX .NE. NCELLX) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AE(IZ,IX,IY)*G%HPN(IZ,IX+1,IY)
+!         IF ((.NOT. G%NEEDSBCS(IZ,IX,IY)) .AND. IY .NE. 1     ) BY(IZ,IX,IY) = BY(IZ,IX,IY) + AS(IZ,IX,IY)*G%HPN(IZ,IX,IY-1)
+!         IF ((.NOT. G%NEEDSBCN(IZ,IX,IY)) .AND. IY .NE. NCELLY) BY(IZ,IX,IY) = BY(IZ,IX,IY) + AN(IZ,IX,IY)*G%HPN(IZ,IX,IY+1)
+!      ENDDO
+!      ENDDO
+!      ENDDO
+!   ENDIF
+!
+!   IF ((.NOT. SWEEPZ) .AND. SWEEPX .AND. (.NOT. SWEEPY)) THEN
+!      DO IY = 1, NCELLY
+!      DO IX = 1, NCELLX
+!      DO IZ = 1, NCELLZ
+!         BZ(IZ,IX,IY) = 0D0; BY(IZ,IX,IY) = 0D0
+!         IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+!         IF ((.NOT. G%NEEDSBCT(IZ,IX,IY)) .AND. IZ .NE. 1     ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AT(IZ,IX,IY)*G%HPN(IZ-1,IX,IY)
+!         IF ((.NOT. G%NEEDSBCB(IZ,IX,IY)) .AND. IZ .NE. NCELLZ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AB(IZ,IX,IY)*G%HPN(IZ+1,IX,IY)
+!         IF ((.NOT. G%NEEDSBCS(IZ,IX,IY)) .AND. IY .NE. 1     ) BY(IZ,IX,IY) = BY(IZ,IX,IY) + AS(IZ,IX,IY)*G%HPN(IZ,IX,IY-1)
+!         IF ((.NOT. G%NEEDSBCN(IZ,IX,IY)) .AND. IY .NE. NCELLY) BY(IZ,IX,IY) = BY(IZ,IX,IY) + AN(IZ,IX,IY)*G%HPN(IZ,IX,IY+1)
+!      ENDDO
+!      ENDDO
+!      ENDDO
+!   ENDIF
+!
+!   IF ((.NOT. SWEEPZ) .AND. (.NOT. SWEEPX) .AND. SWEEPY) THEN
+!      DO IY = 1, NCELLY
+!      DO IX = 1, NCELLX
+!      DO IZ = 1, NCELLZ
+!         BZ(IZ,IX,IY) = 0D0; BX(IZ,IX,IY) = 0D0
+!         IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+!         IF ((.NOT. G%NEEDSBCT(IZ,IX,IY)) .AND. IZ .NE. 1     ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AT(IZ,IX,IY)*G%HPN(IZ-1,IX,IY)
+!         IF ((.NOT. G%NEEDSBCB(IZ,IX,IY)) .AND. IZ .NE. NCELLZ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AB(IZ,IX,IY)*G%HPN(IZ+1,IX,IY)
+!         IF ((.NOT. G%NEEDSBCW(IZ,IX,IY)) .AND. IX .NE. 1     ) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AW(IZ,IX,IY)*G%HPN(IZ,IX-1,IY)
+!         IF ((.NOT. G%NEEDSBCE(IZ,IX,IY)) .AND. IX .NE. NCELLX) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AE(IZ,IX,IY)*G%HPN(IZ,IX+1,IY)
+!      ENDDO
+!      ENDDO
+!      ENDDO
+!   ENDIF
+!
+!ENDIF
+
+IF (SWEEPZ) THEN 
+!   DO IY = 1, NCELLY
+!   DO IX = 1, NCELLX
+!   DO IZ = 1, NCELLZ
+!      BX(IZ,IX,IY) = 0D0; BY(IZ,IX,IY) = 0D0
+!      IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+!      IF ((.NOT. G%NEEDSBCW(IZ,IX,IY)) .AND. IX .NE. 1     ) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AW(IZ,IX,IY)*G%HPN(IZ,IX-1,IY)
+!      IF ((.NOT. G%NEEDSBCE(IZ,IX,IY)) .AND. IX .NE. NCELLX) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AE(IZ,IX,IY)*G%HPN(IZ,IX+1,IY)
+!      IF ((.NOT. G%NEEDSBCS(IZ,IX,IY)) .AND. IY .NE. 1     ) BY(IZ,IX,IY) = BY(IZ,IX,IY) + AS(IZ,IX,IY)*G%HPN(IZ,IX,IY-1)
+!      IF ((.NOT. G%NEEDSBCN(IZ,IX,IY)) .AND. IY .NE. NCELLY) BY(IZ,IX,IY) = BY(IZ,IX,IY) + AN(IZ,IX,IY)*G%HPN(IZ,IX,IY+1)
+!   ENDDO
+!   ENDDO
+!   ENDDO
+
+   DO IX = 1, NCELLX
+   DO IY = 1, NCELLY
+      DO IZ = 1, NCELLZ
+         IF (G%IMASK(IZ,IX,IY) .NE. 0) THEN 
+            BX(IZ,IX,IY) = 0D0; BY(IZ,IX,IY) = 0D0
+            IF ((.NOT. G%NEEDSBCW(IZ,IX,IY)) .AND. IX .NE. 1     ) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AW(IZ,IX,IY)*G%HPN(IZ,IX-1,IY)
+            IF ((.NOT. G%NEEDSBCE(IZ,IX,IY)) .AND. IX .NE. NCELLX) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AE(IZ,IX,IY)*G%HPN(IZ,IX+1,IY)
+            IF ((.NOT. G%NEEDSBCS(IZ,IX,IY)) .AND. IY .NE. 1     ) BY(IZ,IX,IY) = BY(IZ,IX,IY) + AS(IZ,IX,IY)*G%HPN(IZ,IX,IY-1)
+            IF ((.NOT. G%NEEDSBCN(IZ,IX,IY)) .AND. IY .NE. NCELLY) BY(IZ,IX,IY) = BY(IZ,IX,IY) + AN(IZ,IX,IY)*G%HPN(IZ,IX,IY+1)
+            AP(IZ,IX,IY) = APSTART(IZ,IX,IY) / ALPHA_H
+            B (IZ,IX,IY) = BSTART (IZ,IX,IY) + BX (IZ,IX,IY) + BY (IZ,IX,IY) + AP(IZ,IX,IY) * G%HPN(IZ,IX,IY) * (1D0 - ALPHA_H) 
+         ENDIF
+      ENDDO
+      IF (IX .EQ. 3 .AND. IY .EQ. 2) THEN
+         CONTINUE
+      ENDIF
+
+      CALL TDMA_SOLVER_GENERAL(NCELLZ,PTR(:,IX,IY),AP(:,IX,IY),AB(:,IX,IY),AT(:,IX,IY),B(:,IX,IY))!      CONTINUE
+
+   ENDDO
+   ENDDO
+ENDIF
+
+IF (SWEEPX) THEN
+
+!   DO IY = 1, NCELLY
+!   DO IX = 1, NCELLX
+!   DO IZ = 1, NCELLZ
+!      BZ(IZ,IX,IY) = 0D0; BY(IZ,IX,IY) = 0D0
+!      IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+!      IF ((.NOT. G%NEEDSBCT(IZ,IX,IY)) .AND. IZ .NE. 1     ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AT(IZ,IX,IY)*G%HPN(IZ-1,IX,IY)
+!      IF ((.NOT. G%NEEDSBCB(IZ,IX,IY)) .AND. IZ .NE. NCELLZ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AB(IZ,IX,IY)*G%HPN(IZ+1,IX,IY)
+!      IF ((.NOT. G%NEEDSBCS(IZ,IX,IY)) .AND. IY .NE. 1     ) BY(IZ,IX,IY) = BY(IZ,IX,IY) + AS(IZ,IX,IY)*G%HPN(IZ,IX,IY-1)
+!      IF ((.NOT. G%NEEDSBCN(IZ,IX,IY)) .AND. IY .NE. NCELLY) BY(IZ,IX,IY) = BY(IZ,IX,IY) + AN(IZ,IX,IY)*G%HPN(IZ,IX,IY+1)
+!   ENDDO
+!   ENDDO
+!   ENDDO
+ 
+   DO IZ = 1, NCELLZ
+   DO IY = 1, NCELLY
+      DO IX = 1, NCELLX
+         IF (G%IMASK(IZ,IX,IY) .NE. 0) THEN 
+            BZ(IZ,IX,IY) = 0D0; BY(IZ,IX,IY) = 0D0
+            IF ((.NOT. G%NEEDSBCT(IZ,IX,IY)) .AND. IZ .NE. 1     ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AT(IZ,IX,IY)*G%HPN(IZ-1,IX,IY)
+            IF ((.NOT. G%NEEDSBCB(IZ,IX,IY)) .AND. IZ .NE. NCELLZ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AB(IZ,IX,IY)*G%HPN(IZ+1,IX,IY)
+            IF ((.NOT. G%NEEDSBCS(IZ,IX,IY)) .AND. IY .NE. 1     ) BY(IZ,IX,IY) = BY(IZ,IX,IY) + AS(IZ,IX,IY)*G%HPN(IZ,IX,IY-1)
+            IF ((.NOT. G%NEEDSBCN(IZ,IX,IY)) .AND. IY .NE. NCELLY) BY(IZ,IX,IY) = BY(IZ,IX,IY) + AN(IZ,IX,IY)*G%HPN(IZ,IX,IY+1)
+            AP(IZ,IX,IY) = APSTART(IZ,IX,IY) / ALPHA_H
+            B (IZ,IX,IY) = BSTART (IZ,IX,IY) + BY (IZ,IX,IY) + BZ (IZ,IX,IY) + AP(IZ,IX,IY) * G%HPN(IZ,IX,IY) * (1D0 - ALPHA_H)
+         ENDIF
+      ENDDO
+      CALL TDMA_SOLVER_GENERAL(NCELLX,PTR(IZ,:,IY),AP(IZ,:,IY),AE(IZ,:,IY),AW(IZ,:,IY),B(IZ,:,IY))
+   ENDDO
+   ENDDO
+ENDIF
+
+IF (SWEEPY) THEN
+
+!   DO IY = 1, NCELLY
+!   DO IX = 1, NCELLX
+!   DO IZ = 1, NCELLZ
+!      BZ(IZ,IX,IY) = 0D0; BX(IZ,IX,IY) = 0D0
+!      IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+!      IF ((.NOT. G%NEEDSBCT(IZ,IX,IY)) .AND. IZ .NE. 1     ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AT(IZ,IX,IY)*G%HPN(IZ-1,IX,IY)
+!      IF ((.NOT. G%NEEDSBCB(IZ,IX,IY)) .AND. IZ .NE. NCELLZ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AB(IZ,IX,IY)*G%HPN(IZ+1,IX,IY)
+!      IF ((.NOT. G%NEEDSBCW(IZ,IX,IY)) .AND. IX .NE. 1     ) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AW(IZ,IX,IY)*G%HPN(IZ,IX-1,IY)
+!      IF ((.NOT. G%NEEDSBCE(IZ,IX,IY)) .AND. IX .NE. NCELLX) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AE(IZ,IX,IY)*G%HPN(IZ,IX+1,IY)
+!   ENDDO
+!   ENDDO
+!   ENDDO
+
+   DO IZ = 1, NCELLZ
+   DO IX = 1, NCELLX
+      DO IY = 1, NCELLY
+         IF (G%IMASK(IZ,IX,IY) .NE. 0) THEN 
+            BZ(IZ,IX,IY) = 0D0; BX(IZ,IX,IY) = 0D0
+            IF ((.NOT. G%NEEDSBCT(IZ,IX,IY)) .AND. IZ .NE. 1     ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AT(IZ,IX,IY)*G%HPN(IZ-1,IX,IY)
+            IF ((.NOT. G%NEEDSBCB(IZ,IX,IY)) .AND. IZ .NE. NCELLZ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AB(IZ,IX,IY)*G%HPN(IZ+1,IX,IY)
+            IF ((.NOT. G%NEEDSBCW(IZ,IX,IY)) .AND. IX .NE. 1     ) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AW(IZ,IX,IY)*G%HPN(IZ,IX-1,IY)
+            IF ((.NOT. G%NEEDSBCE(IZ,IX,IY)) .AND. IX .NE. NCELLX) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AE(IZ,IX,IY)*G%HPN(IZ,IX+1,IY)
+            AP(IZ,IX,IY) = APSTART(IZ,IX,IY) / ALPHA_H
+            B (IZ,IX,IY) = BSTART (IZ,IX,IY) + BX (IZ,IX,IY) + BZ (IZ,IX,IY) + AP(IZ,IX,IY) * G%HPN(IZ,IX,IY) * (1D0 - ALPHA_H) 
+         ENDIF
+      ENDDO
+      CALL TDMA_SOLVER_GENERAL(NCELLY,PTR(IZ,IX,:),AP(IZ,IX,:),AN(IZ,IX,:),AS(IZ,IX,:),B(IZ,IX,:))
+   ENDDO
+   ENDDO
+ENDIF
+
+CALL GET_CPU_TIME(TMID1)
+GPG%TUSED(1) = GPG%TUSED(1) + TMID1 - TSTART 
+
+! Parallelizing this loop causes the compiler to fail:
+!!$omp PARALLEL DO SCHEDULE(STATIC) PRIVATE(IZ,IX,IY,ISPEC,TGUESS,SUMYIC0I)
+DO IY = 1, NCELLY
+DO IX = 1, NCELLX
+DO IZ = 1, NCELLZ  !Calculate temperature from enthalpy
+   IF (G%HPN(IZ,IX,IY).NE.G%HPN(IZ,IX,IY) .OR. G%HPN(IZ,IX,IY).EQ.GPG%POSINF .OR. G%HPN(IZ,IX,IY).EQ.GPG%NEGINF) THEN
+      GPG%NAN = .TRUE.
+   ENDIF
+   IF (GPG%USE_TOFH_NEWTON) THEN
+      TGUESS = G%TP(IZ,IX,IY) + (G%HPN(IZ,IX,IY)-G%HP(IZ,IX,IY))/G%CPS(IZ,IX,IY)
+      G%TPN(IZ,IX,IY)= TOFH_NEWTON(G%HPN(IZ,IX,IY),TGUESS,SPROP%NSSPEC,G%YIN(:,IZ,IX,IY))
+   ELSE
+      SUMYIC0I = 0D0
+      DO ISPEC = 1, SPROP%NSSPEC
+         SUMYIC0I= SUMYIC0I + G%YIN(ISPEC,IZ,IX,IY)*SPROP%C0(ISPEC)
+      ENDDO
+      G%TPN(IZ,IX,IY) = GPG%TDATUM + G%HPN(IZ,IX,IY) / SUMYIC0I
+   ENDIF
+ENDDO
+ENDDO
+ENDDO
+!!$omp END PARALLEL DO
+
+CALL GET_CPU_TIME(TMID2)
+GPG%TUSED(2) = GPG%TUSED(2) + TMID2 - TMID1 
+
+!! Check convergence - RELATIVE TOLERANCE
+!!$omp PARALLEL DO SCHEDULE(STATIC)
+!DO IY = 1, NCELLY
+!DO IX = 1, NCELLX
+!DO IZ = 1, NCELLZ
+!   CONVERGED_TMP(IZ,IX,IY) = .TRUE.
+!   G%RESIDUAL_TMP(IZ,IX,IY) = REAL(G%IMASK(IZ,IX,IY))*ABS(G%TPN(IZ,IX,IY) - TPNOLD(IZ,IX,IY)) / MAX(EPS_T, ABS(TPNOLD(IZ,IX,IY) - GPG%TAMB))
+!   IF (G%RESIDUAL_TMP(IZ,IX,IY) .GT. GPG%TMPTOL*ALPHA_H) CONVERGED_TMP(IZ,IX,IY) = .FALSE. 
+!   IF (G%TPN(IZ,IX,IY).NE.G%TPN(IZ,IX,IY) .OR. G%TPN(IZ,IX,IY).EQ.GPG%POSINF .OR. G%TPN(IZ,IX,IY).EQ.GPG%NEGINF) THEN
+!      CONVERGED_TMP(IZ,IX,IY) = .FALSE.
+!      GPG%NAN = .TRUE.
+!   ENDIF
+!ENDDO
+!ENDDO
+!ENDDO
+!!$omp END PARALLEL DO
+
+! Check convergence - ABSOLUTE TOLERANCE
+!$omp PARALLEL DO SCHEDULE(STATIC)
+DO IY = 1, NCELLY
+DO IX = 1, NCELLX
+DO IZ = 1, NCELLZ
+   CONVERGED_TMP(IZ,IX,IY) = .TRUE.
+   G%RESIDUAL_TMP(IZ,IX,IY) = REAL(G%IMASK(IZ,IX,IY))*ABS(G%TPN(IZ,IX,IY) - TPNOLD(IZ,IX,IY))
+   IF (G%RESIDUAL_TMP(IZ,IX,IY) .GT. GPG%TMPTOL*ALPHA_H) CONVERGED_TMP(IZ,IX,IY) = .FALSE. 
+   IF (G%TPN(IZ,IX,IY).NE.G%TPN(IZ,IX,IY) .OR. G%TPN(IZ,IX,IY).EQ.GPG%POSINF .OR. G%TPN(IZ,IX,IY).EQ.GPG%NEGINF) THEN
+      CONVERGED_TMP(IZ,IX,IY) = .FALSE.
+      GPG%NAN = .TRUE.
+   ENDIF
+ENDDO
+ENDDO
+ENDDO
+!$omp END PARALLEL DO
+
+
+CALL GET_CPU_TIME(TEND)
+GPG%TUSED(1) = GPG%TUSED(1) + TEND - TMID2 
+
+! *****************************************************************************
+END SUBROUTINE SOLID_ENTHALPY_SOLVER_TEST
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE SOLID_ENTHALPY_SOLVER_ANISOTROPIC(NCELLZ,NCELLX,NCELLY,ITER,CONVERGED_TMP,ALPHA_H,DTIME)
+! *****************************************************************************
+
+INTEGER, INTENT(IN) :: NCELLX,NCELLY,NCELLZ,ITER
+REAL(EB), INTENT(IN) :: ALPHA_H,DTIME
+LOGICAL, INTENT(OUT) :: CONVERGED_TMP(1:NCELLZ,1:NCELLX,1:NCELLY)
+LOGICAL :: SWEEPZ, SWEEPX, SWEEPY
+INTEGER :: ISPEC,IZ,IX,IY
+REAL(EB) :: TSTART,TMID1,TMID2,TEND,TGUESS,SUMYIC0I,EMIS,QCONV
+REAL(EB), POINTER, DIMENSION(:,:,:) :: AP0,AP,AB,AT,AE,AW,AN,AS,B,TPNOLD,BCSTOT,PTR,BZ,BX,BY,BSTART,APSTART,SNET
+REAL(EB), POINTER, DIMENSION(:,:,:) :: A11W, A12W, A13W, A11E, A12E, A13E, &
+                                       A21S, A22S, A23S, A21N, A22N, A23N, &
+                                       A31T, A32T, A33T, A31B, A32B, A33B
+
+REAL(EB), PARAMETER :: EPS_T = 1.0
+
+CALL GET_CPU_TIME(TSTART)
+
+AP0     => G%RWORK01
+AP      => G%RWORK02
+AB      => G%RWORK03
+AT      => G%RWORK04
+AE      => G%RWORK05
+AW      => G%RWORK06
+AN      => G%RWORK07
+AS      => G%RWORK08
+B       => G%RWORK09
+TPNOLD  => G%RWORK10
+BCSTOT  => G%RWORK11
+PTR     => G%RWORK12
+BZ      => G%RWORK13
+BX      => G%RWORK14
+BY      => G%RWORK15
+BSTART  => G%RWORK16
+APSTART => G%RWORK17
+SNET    => G%RWORK18
+
+A11W    => G%RWORK19
+A12W    => G%RWORK20
+A13W    => G%RWORK21
+A11E    => G%RWORK22
+A12E    => G%RWORK23
+A13E    => G%RWORK24
+
+A21S    => G%RWORK25
+A22S    => G%RWORK26
+A23S    => G%RWORK27
+A21N    => G%RWORK28
+A22N    => G%RWORK29
+A23N    => G%RWORK30
+
+A31T    => G%RWORK31
+A32T    => G%RWORK32
+A33T    => G%RWORK33
+A31B    => G%RWORK34
+A32B    => G%RWORK35
+A33B    => G%RWORK36
+
+PTR => G%HPN
+
+SWEEPZ = .FALSE.
+SWEEPX = .TRUE.
+SWEEPY = .FALSE.
+
+!$omp PARALLEL DO SCHEDULE(DYNAMIC,4)
+DO IY = 1, NCELLY
+DO IX = 1, NCELLX
+DO IZ = 1, NCELLZ
+   TPNOLD (IZ,IX,IY) = G%TPN(IZ,IX,IY)
+   IF (G%IMASK(IZ,IX,IY) .NE. 0) THEN
+      A11W(IZ,IX,IY) = G%K_TENSOR(IZ,IX,IY,1,1) * G%DYDZ(IZ,IX,IY) / ( G%DXW(IZ,IX,IY) * G%CPS(IZ,IX,IY) )
+      A12W(IZ,IX,IY) = G%K_TENSOR(IZ,IX,IY,1,2) * G%DYDZ(IZ,IX,IY) / ( G%DYS(IZ,IX,IY) * G%CPS(IZ,IX,IY) )
+      A13W(IZ,IX,IY) = G%K_TENSOR(IZ,IX,IY,1,3) * G%DYDZ(IZ,IX,IY) / ( G%DZT(IZ,IX,IY) * G%CPS(IZ,IX,IY) )
+
+      A11E(IZ,IX,IY) = A11W(IZ,IX,IY)
+      A12E(IZ,IX,IY) = A12W(IZ,IX,IY)
+      A13E(IZ,IX,IY) = A13W(IZ,IX,IY)
+
+      A21S(IZ,IX,IY) = G%K_TENSOR(IZ,IX,IY,2,1) * G%DXDZ(IZ,IX,IY) / ( G%DXW(IZ,IX,IY) * G%CPS(IZ,IX,IY) )
+      A22S(IZ,IX,IY) = G%K_TENSOR(IZ,IX,IY,2,2) * G%DXDZ(IZ,IX,IY) / ( G%DYS(IZ,IX,IY) * G%CPS(IZ,IX,IY) )
+      A23S(IZ,IX,IY) = G%K_TENSOR(IZ,IX,IY,2,3) * G%DXDZ(IZ,IX,IY) / ( G%DZT(IZ,IX,IY) * G%CPS(IZ,IX,IY) )
+
+      A21N(IZ,IX,IY) = A21S(IZ,IX,IY)
+      A22N(IZ,IX,IY) = A22S(IZ,IX,IY)
+      A23N(IZ,IX,IY) = A23S(IZ,IX,IY)
+
+      A31T(IZ,IX,IY) = G%K_TENSOR(IZ,IX,IY,3,1) * G%DXDY(IZ,IX,IY) / ( G%DXW(IZ,IX,IY) * G%CPS(IZ,IX,IY) )
+      A32T(IZ,IX,IY) = G%K_TENSOR(IZ,IX,IY,3,2) * G%DXDY(IZ,IX,IY) / ( G%DYS(IZ,IX,IY) * G%CPS(IZ,IX,IY) )
+      A33T(IZ,IX,IY) = G%K_TENSOR(IZ,IX,IY,3,3) * G%DXDY(IZ,IX,IY) / ( G%DZT(IZ,IX,IY) * G%CPS(IZ,IX,IY) )
+
+      A31B(IZ,IX,IY) = A31T(IZ,IX,IY)
+      A32B(IZ,IX,IY) = A32T(IZ,IX,IY)
+      A33B(IZ,IX,IY) = A33T(IZ,IX,IY)
+
+      AW(IZ,IX,IY) = A11W(IZ,IX,IY) + A21S(IZ,IX,IY) + A31T(IZ,IX,IY)
+      AS(IZ,IX,IY) = A12W(IZ,IX,IY) + A22S(IZ,IX,IY) + A32T(IZ,IX,IY)
+      AT(IZ,IX,IY) = A13W(IZ,IX,IY) + A23S(IZ,IX,IY) + A33T(IZ,IX,IY)
+
+      AE(IZ,IX,IY) = A11E(IZ,IX,IY) + A21N(IZ,IX,IY) + A31B(IZ,IX,IY)
+      AN(IZ,IX,IY) = A12E(IZ,IX,IY) + A22N(IZ,IX,IY) + A32B(IZ,IX,IY)
+      AB(IZ,IX,IY) = A13E(IZ,IX,IY) + A23N(IZ,IX,IY) + A33B(IZ,IX,IY)
+
+      IF (G%NEEDSBCE(IZ,IX,IY)) AE(IZ,IX,IY) = 0D0
+      IF (G%NEEDSBCW(IZ,IX,IY)) AW(IZ,IX,IY) = 0D0
+      IF (G%NEEDSBCS(IZ,IX,IY)) AS(IZ,IX,IY) = 0D0
+      IF (G%NEEDSBCN(IZ,IX,IY)) AN(IZ,IX,IY) = 0D0
+      IF (G%NEEDSBCT(IZ,IX,IY)) AT(IZ,IX,IY) = 0D0
+      IF (G%NEEDSBCB(IZ,IX,IY)) AB(IZ,IX,IY) = 0D0
+
+      AP0(IZ,IX,IY) = G%RDLTZ(IZ,IX,IY) * G%DXDY(IZ,IX,IY) / DTIME
+
+      AP (IZ,IX,IY) = AP0(IZ,IX,IY) + AB(IZ,IX,IY) + AT(IZ,IX,IY) + AE(IZ,IX,IY) + AW(IZ,IX,IY) + AN(IZ,IX,IY) + AS(IZ,IX,IY)
+      B  (IZ,IX,IY) = AP0(IZ,IX,IY) * G%HP(IZ,IX,IY)
+
+   ELSE
+      B  (IZ,IX,IY) = G%HP(IZ,IX,IY)
+      AP (IZ,IX,IY) = 1D0
+      AT (IZ,IX,IY) = 0D0
+      AB (IZ,IX,IY) = 0D0
+      AE (IZ,IX,IY) = 0D0
+      AW (IZ,IX,IY) = 0D0
+      AS (IZ,IX,IY) = 0D0
+      AN (IZ,IX,IY) = 0D0
+   ENDIF
+ENDDO
+ENDDO
+ENDDO
+!$omp END PARALLEL DO
+
+! Set boundary conditions:
+IF (NCELLZ .GT. 1 .AND. NCELLX .GT. 1 .AND. NCELLY .GT. 1) THEN
+!$omp PARALLEL DO SCHEDULE(STATIC) PRIVATE(QCONV,EMIS,ISPEC)
+   DO IY = 1, NCELLY
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+
+      BCSTOT(IZ,IX,IY) = 0D0
+
+      IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+
+      IF (G%NEEDSBCT(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY,-3)%TFIXED .LT. 0D0) THEN         
+             QCONV = GPBCP(IZ,IX,IY,-3)%HC0 * (GPBCP(IZ,IX,IY,-3)%TINF - G%TPN(IZ,IX,IY)) 
+             EMIS  = CALC_EMIS(IZ,IX,IY)
+             GPBCP(IZ,IX,IY,-3)%QENET = EMIS * GPBCP(IZ,IX,IY,-3)%QE
+             IF (GPBCP(IZ,IX,IY,-3)%RERAD) GPBCP(IZ,IX,IY,-3)%QENET = GPBCP(IZ,IX,IY,-3)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY,-3)%TINF**4D0)
+             BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + (QCONV + GPBCP(IZ,IX,IY,-3)%QENET) / G%DLTZN(IZ,IX,IY)
+          ELSE
+             GPBCP(IZ,IX,IY,-3)%HFIXED = 0D0
+             DO ISPEC = 1, SPROP%NSSPEC
+                GPBCP(IZ,IX,IY,-3)%HFIXED = GPBCP(IZ,IX,IY,-3)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY,-3)%TFIXED)
+             ENDDO
+             CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY,-3)%HFIXED)
+          ENDIF
+       ENDIF
+
+      IF (G%NEEDSBCB(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY, 3)%TFIXED .LT. 0D0) THEN         
+            QCONV = GPBCP(IZ,IX,IY, 3)%HC0 * (GPBCP(IZ,IX,IY, 3)%TINF - G%TPN(IZ,IX,IY)) 
+            EMIS  = CALC_EMIS(IZ,IX,IY)
+            GPBCP(IZ,IX,IY, 3)%QENET = EMIS * GPBCP(IZ,IX,IY, 3)%QE
+            IF (GPBCP(IZ,IX,IY, 3)%RERAD) GPBCP(IZ,IX,IY, 3)%QENET = GPBCP(IZ,IX,IY, 3)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY, 3)%TINF**4D0)
+            BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + (QCONV + GPBCP(IZ,IX,IY, 3)%QENET) / G%DLTZN(IZ,IX,IY)
+         ELSE
+            GPBCP(IZ,IX,IY, 3)%HFIXED = 0D0
+            DO ISPEC = 1, SPROP%NSSPEC
+               GPBCP(IZ,IX,IY, 3)%HFIXED = GPBCP(IZ,IX,IY, 3)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY, 3)%TFIXED)
+            ENDDO
+            CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY, 3)%HFIXED)
+         ENDIF
+      ENDIF
+
+      IF (G%NEEDSBCW(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY,-1)%TFIXED .LT. 0D0) THEN         
+            QCONV = GPBCP(IZ,IX,IY,-1)%HC0 * (GPBCP(IZ,IX,IY,-1)%TINF - G%TPN(IZ,IX,IY)) 
+            EMIS  = CALC_EMIS(IZ,IX,IY)
+            GPBCP(IZ,IX,IY,-1)%QENET = EMIS * GPBCP(IZ,IX,IY,-1)%QE
+            IF (GPBCP(IZ,IX,IY,-1)%RERAD) GPBCP(IZ,IX,IY,-1)%QENET = GPBCP(IZ,IX,IY,-1)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY,-1)%TINF**4D0)
+            BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + (QCONV + GPBCP(IZ,IX,IY,-1)%QENET) / G%DLTXN(IZ,IX,IY)
+         ELSE
+            GPBCP(IZ,IX,IY,-1)%HFIXED = 0D0
+            DO ISPEC = 1, SPROP%NSSPEC
+               GPBCP(IZ,IX,IY,-1)%HFIXED = GPBCP(IZ,IX,IY,-1)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY,-1)%TFIXED)
+            ENDDO
+            CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY,-1)%HFIXED)
+         ENDIF
+      ENDIF
+
+      IF (G%NEEDSBCE(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY,1)%TFIXED .LT. 0D0) THEN         
+            QCONV = GPBCP(IZ,IX,IY, 1)%HC0 * (GPBCP(IZ,IX,IY,1)%TINF - G%TPN(IZ,IX,IY)) 
+            EMIS  = CALC_EMIS(IZ,IX,IY)
+            GPBCP(IZ,IX,IY, 1)%QENET = EMIS * GPBCP(IZ,IX,IY, 1)%QE
+            IF (GPBCP(IZ,IX,IY, 1)%RERAD) GPBCP(IZ,IX,IY, 1)%QENET = GPBCP(IZ,IX,IY, 1)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY, 1)%TINF**4D0)
+            BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + (QCONV + GPBCP(IZ,IX,IY, 1)%QENET) / G%DLTXN(IZ,IX,IY)
+         ELSE
+            GPBCP(IZ,IX,IY, 1)%HFIXED = 0D0
+            DO ISPEC = 1, SPROP%NSSPEC
+               GPBCP(IZ,IX,IY, 1)%HFIXED = GPBCP(IZ,IX,IY, 1)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY, 1)%TFIXED)
+            ENDDO
+            CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY, 1)%HFIXED)
+         ENDIF
+      ENDIF
+
+      IF (G%NEEDSBCS(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY,-2)%TFIXED .LT. 0D0) THEN
+            QCONV = GPBCP(IZ,IX,IY,-2)%HC0 * (GPBCP(IZ,IX,IY,-2)%TINF - G%TPN(IZ,IX,IY)) 
+            EMIS  = CALC_EMIS(IZ,IX,IY)
+            GPBCP(IZ,IX,IY,-2)%QENET = EMIS * GPBCP(IZ,IX,IY,-2)%QE
+            IF (GPBCP(IZ,IX,IY,-2)%RERAD) GPBCP(IZ,IX,IY,-2)%QENET = GPBCP(IZ,IX,IY,-2)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY,-2)%TINF**4D0)
+            BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + (QCONV + GPBCP(IZ,IX,IY,-2)%QENET) / G%DLTYN(IZ,IX,IY)
+         ELSE
+            GPBCP(IZ,IX,IY,-2)%HFIXED = 0D0
+            DO ISPEC = 1, SPROP%NSSPEC
+               GPBCP(IZ,IX,IY,-2)%HFIXED = GPBCP(IZ,IX,IY,-2)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY,-2)%TFIXED)
+            ENDDO
+            CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY,-2)%HFIXED)
+         ENDIF
+      ENDIF
+
+      IF (G%NEEDSBCN(IZ,IX,IY)) THEN
+         IF (GPBCP(IZ,IX,IY, 2)%TFIXED .LT. 0D0) THEN
+            QCONV = GPBCP(IZ,IX,IY, 2)%HC0 * (GPBCP(IZ,IX,IY, 2)%TINF - G%TPN(IZ,IX,IY)) 
+            EMIS  = CALC_EMIS(IZ,IX,IY)
+            GPBCP(IZ,IX,IY, 2)%QENET = EMIS * GPBCP(IZ,IX,IY, 2)%QE
+            IF (GPBCP(IZ,IX,IY, 2)%RERAD) GPBCP(IZ,IX,IY, 2)%QENET = GPBCP(IZ,IX,IY, 2)%QENET - EMIS * 5.67D-8 * (G%TPN(IZ,IX,IY)**4D0 - GPBCP(IZ,IX,IY, 2)%TINF**4D0)
+            BCSTOT(IZ,IX,IY) = BCSTOT(IZ,IX,IY) + (QCONV + GPBCP(IZ,IX,IY, 2)%QENET) / G%DLTYN(IZ,IX,IY)
+         ELSE
+            GPBCP(IZ,IX,IY, 2)%HFIXED = 0D0
+            DO ISPEC = 1, SPROP%NSSPEC
+               GPBCP(IZ,IX,IY, 2)%HFIXED = GPBCP(IZ,IX,IY, 2)%HFIXED + G%YIN(ISPEC,IZ,IX,IY) * HOFT(ISPEC,GPBCP(IZ,IX,IY, 2)%TFIXED)
+            ENDDO
+            CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AT(IZ,IX,IY),AB(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY, 2)%HFIXED)
+         ENDIF
+      ENDIF
+
+   ENDDO
+   ENDDO
+   ENDDO
+!$omp END PARALLEL DO
+ENDIF !End of 3D section
+
+!IF (GPG%SHYI_CORRECTION) THEN
+!
+!!$omp PARALLEL DO SCHEDULE(STATIC)
+!   DO IY = 1, NCELLY
+!   DO IX = 1, NCELLX
+!   DO IZ = 1, NCELLZ
+!      IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+!      B (IZ,IX,IY) = B (IZ,IX,IY) + G%SHYIDTDMAZ(IZ,IX,IY) 
+!      AP(IZ,IX,IY) = AP(IZ,IX,IY) + G%SHYIAPZ(IZ,IX,IY) / G%HPN(IZ,IX,IY)
+!   
+!      IF (NCELLX .GT. 1) THEN 
+!         B (IZ,IX,IY) = B (IZ,IX,IY) + G%SHYIDTDMAX(IZ,IX,IY) 
+!         AP(IZ,IX,IY) = AP(IZ,IX,IY) + G%SHYIAPX(IZ,IX,IY) / G%HPN(IZ,IX,IY)
+!         IF (NCELLY .GT. 1 .AND. NCELLX .GT. 1) THEN 
+!            B (IZ,IX,IY) = B (IZ,IX,IY) + G%SHYIDTDMAY(IZ,IX,IY) 
+!            AP(IZ,IX,IY) = AP(IZ,IX,IY) + G%SHYIAPY(IZ,IX,IY) / G%HPN(IZ,IX,IY)
+!         ENDIF
+!      ENDIF
+!   
+!      IF (BCSTOT(IZ,IX,IY) .GE. 0D0) THEN
+!         G%SHP(IZ,IX,IY) = G%SHP(IZ,IX,IY) + BCSTOT(IZ,IX,IY)
+!      ELSE
+!         G%SHM(IZ,IX,IY) = G%SHM(IZ,IX,IY) - BCSTOT(IZ,IX,IY)
+!      ENDIF
+!
+!      SNET(IZ,IX,IY) = G%SHP(IZ,IX,IY) - G%SHM(IZ,IX,IY)
+!
+!      IF (SNET(IZ,IX,IY) .GE. 0D0) THEN
+!         B(IZ,IX,IY) = B(IZ,IX,IY) + SNET(IZ,IX,IY)*G%DXDYDZ(IZ,IX,IY)
+!      ELSE
+!         AP(IZ,IX,IY) = AP(IZ,IX,IY) - SNET(IZ,IX,IY)*G%DXDYDZ(IZ,IX,IY) / G%HPN(IZ,IX,IY)      
+!      ENDIF
+!
+!      BSTART (IZ,IX,IY) = B (IZ,IX,IY)
+!      APSTART(IZ,IX,IY) = AP(IZ,IX,IY)
+!
+!   ENDDO
+!   ENDDO
+!   ENDDO
+!!$omp END PARALLEL DO
+!ELSE
+!$omp PARALLEL DO SCHEDULE(STATIC)
+   DO IY = 1, NCELLY
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+      IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+
+      IF (BCSTOT(IZ,IX,IY) .GE. 0D0) THEN
+         G%SHP(IZ,IX,IY) = G%SHP(IZ,IX,IY) + BCSTOT(IZ,IX,IY)
+      ELSE
+         G%SHM(IZ,IX,IY) = G%SHM(IZ,IX,IY) - BCSTOT(IZ,IX,IY)
+      ENDIF
+
+      SNET(IZ,IX,IY) = G%SHP(IZ,IX,IY) - G%SHM(IZ,IX,IY)
+
+      IF (SNET(IZ,IX,IY) .GE. 0D0) THEN
+         B(IZ,IX,IY) = B(IZ,IX,IY) + SNET(IZ,IX,IY)*G%DXDYDZ(IZ,IX,IY)
+      ELSE
+         AP(IZ,IX,IY) = AP(IZ,IX,IY) - SNET(IZ,IX,IY)*G%DXDYDZ(IZ,IX,IY) / G%HPN(IZ,IX,IY)      
+      ENDIF
+
+      BSTART (IZ,IX,IY) = B (IZ,IX,IY)
+      APSTART(IZ,IX,IY) = AP(IZ,IX,IY)
+
+   ENDDO
+   ENDDO
+   ENDDO
+!$omp END PARALLEL DO
+!ENDIF !SHYI_CORRECTION
+
+IF (SWEEPZ) THEN 
+   DO IX = 1, NCELLX
+   DO IY = 1, NCELLY
+      DO IZ = 1, NCELLZ
+         IF (G%IMASK(IZ,IX,IY) .NE. 0) THEN 
+            BX(IZ,IX,IY) = 0D0; BY(IZ,IX,IY) = 0D0
+            IF ((.NOT. G%NEEDSBCW(IZ,IX,IY)) .AND. IX .NE. 1     ) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AW(IZ,IX,IY)*G%HPN(IZ,IX-1,IY)
+            IF ((.NOT. G%NEEDSBCE(IZ,IX,IY)) .AND. IX .NE. NCELLX) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AE(IZ,IX,IY)*G%HPN(IZ,IX+1,IY)
+            IF ((.NOT. G%NEEDSBCS(IZ,IX,IY)) .AND. IY .NE. 1     ) BY(IZ,IX,IY) = BY(IZ,IX,IY) + AS(IZ,IX,IY)*G%HPN(IZ,IX,IY-1)
+            IF ((.NOT. G%NEEDSBCN(IZ,IX,IY)) .AND. IY .NE. NCELLY) BY(IZ,IX,IY) = BY(IZ,IX,IY) + AN(IZ,IX,IY)*G%HPN(IZ,IX,IY+1)
+            AP(IZ,IX,IY) = APSTART(IZ,IX,IY) / ALPHA_H
+            B (IZ,IX,IY) = BSTART (IZ,IX,IY) + BX (IZ,IX,IY) + BY (IZ,IX,IY) + AP(IZ,IX,IY) * G%HPN(IZ,IX,IY) * (1D0 - ALPHA_H) 
+         ENDIF
+      ENDDO
+      CALL TDMA_SOLVER_GENERAL(NCELLZ,PTR(:,IX,IY),AP(:,IX,IY),AB(:,IX,IY),AT(:,IX,IY),B(:,IX,IY))
+   ENDDO
+   ENDDO
+ENDIF
+
+IF (SWEEPX) THEN
+   DO IZ = 1, NCELLZ
+   DO IY = 1, NCELLY
+      DO IX = 1, NCELLX
+         IF (G%IMASK(IZ,IX,IY) .NE. 0) THEN 
+            BZ(IZ,IX,IY) = 0D0; BY(IZ,IX,IY) = 0D0
+            IF ((.NOT. G%NEEDSBCT(IZ,IX,IY)) .AND. IZ .NE. 1     ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AT(IZ,IX,IY)*G%HPN(IZ-1,IX,IY)
+            IF ((.NOT. G%NEEDSBCB(IZ,IX,IY)) .AND. IZ .NE. NCELLZ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AB(IZ,IX,IY)*G%HPN(IZ+1,IX,IY)
+            IF ((.NOT. G%NEEDSBCS(IZ,IX,IY)) .AND. IY .NE. 1     ) BY(IZ,IX,IY) = BY(IZ,IX,IY) + AS(IZ,IX,IY)*G%HPN(IZ,IX,IY-1)
+            IF ((.NOT. G%NEEDSBCN(IZ,IX,IY)) .AND. IY .NE. NCELLY) BY(IZ,IX,IY) = BY(IZ,IX,IY) + AN(IZ,IX,IY)*G%HPN(IZ,IX,IY+1)
+            AP(IZ,IX,IY) = APSTART(IZ,IX,IY) / ALPHA_H
+            B (IZ,IX,IY) = BSTART (IZ,IX,IY) + BY (IZ,IX,IY) + BZ (IZ,IX,IY) + AP(IZ,IX,IY) * G%HPN(IZ,IX,IY) * (1D0 - ALPHA_H)
+         ENDIF
+      ENDDO
+      CALL TDMA_SOLVER_GENERAL(NCELLX,PTR(IZ,:,IY),AP(IZ,:,IY),AE(IZ,:,IY),AW(IZ,:,IY),B(IZ,:,IY))
+   ENDDO
+   ENDDO
+ENDIF
+
+IF (SWEEPY) THEN
+   DO IZ = 1, NCELLZ
+   DO IX = 1, NCELLX
+      DO IY = 1, NCELLY
+         IF (G%IMASK(IZ,IX,IY) .NE. 0) THEN 
+            BZ(IZ,IX,IY) = 0D0; BX(IZ,IX,IY) = 0D0
+            IF ((.NOT. G%NEEDSBCT(IZ,IX,IY)) .AND. IZ .NE. 1     ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AT(IZ,IX,IY)*G%HPN(IZ-1,IX,IY)
+            IF ((.NOT. G%NEEDSBCB(IZ,IX,IY)) .AND. IZ .NE. NCELLZ) BZ(IZ,IX,IY) = BZ(IZ,IX,IY) + AB(IZ,IX,IY)*G%HPN(IZ+1,IX,IY)
+            IF ((.NOT. G%NEEDSBCW(IZ,IX,IY)) .AND. IX .NE. 1     ) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AW(IZ,IX,IY)*G%HPN(IZ,IX-1,IY)
+            IF ((.NOT. G%NEEDSBCE(IZ,IX,IY)) .AND. IX .NE. NCELLX) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AE(IZ,IX,IY)*G%HPN(IZ,IX+1,IY)
+            AP(IZ,IX,IY) = APSTART(IZ,IX,IY) / ALPHA_H
+            B (IZ,IX,IY) = BSTART (IZ,IX,IY) + BX (IZ,IX,IY) + BZ (IZ,IX,IY) + AP(IZ,IX,IY) * G%HPN(IZ,IX,IY) * (1D0 - ALPHA_H) 
+         ENDIF
+      ENDDO
+      CALL TDMA_SOLVER_GENERAL(NCELLY,PTR(IZ,IX,:),AP(IZ,IX,:),AN(IZ,IX,:),AS(IZ,IX,:),B(IZ,IX,:))
+   ENDDO
+   ENDDO
+ENDIF
+
+CALL GET_CPU_TIME(TMID1)
+GPG%TUSED(1) = GPG%TUSED(1) + TMID1 - TSTART 
+
+! Parallelizing this loop causes the compiler to fail:
+!!$omp PARALLEL DO SCHEDULE(STATIC) PRIVATE(IZ,IX,IY,ISPEC,TGUESS,SUMYIC0I)
+DO IY = 1, NCELLY
+DO IX = 1, NCELLX
+DO IZ = 1, NCELLZ  !Calculate temperature from enthalpy
+   IF (G%HPN(IZ,IX,IY).NE.G%HPN(IZ,IX,IY) .OR. G%HPN(IZ,IX,IY).EQ.GPG%POSINF .OR. G%HPN(IZ,IX,IY).EQ.GPG%NEGINF) THEN
+      GPG%NAN = .TRUE.
+   ENDIF
+   IF (GPG%USE_TOFH_NEWTON) THEN
+      TGUESS = G%TP(IZ,IX,IY) + (G%HPN(IZ,IX,IY)-G%HP(IZ,IX,IY))/G%CPS(IZ,IX,IY)
+      G%TPN(IZ,IX,IY)= TOFH_NEWTON(G%HPN(IZ,IX,IY),TGUESS,SPROP%NSSPEC,G%YIN(:,IZ,IX,IY))
+   ELSE
+      SUMYIC0I = 0D0
+      DO ISPEC = 1, SPROP%NSSPEC
+         SUMYIC0I= SUMYIC0I + G%YIN(ISPEC,IZ,IX,IY)*SPROP%C0(ISPEC)
+      ENDDO
+      G%TPN(IZ,IX,IY) = GPG%TDATUM + G%HPN(IZ,IX,IY) / SUMYIC0I
+   ENDIF
+ENDDO
+ENDDO
+ENDDO
+!!$omp END PARALLEL DO
+
+CALL GET_CPU_TIME(TMID2)
+GPG%TUSED(2) = GPG%TUSED(2) + TMID2 - TMID1 
+
+! Check convergence - ABSOLUTE TOLERANCE
+!$omp PARALLEL DO SCHEDULE(STATIC)
+DO IY = 1, NCELLY
+DO IX = 1, NCELLX
+DO IZ = 1, NCELLZ
+   CONVERGED_TMP(IZ,IX,IY) = .TRUE.
+   G%RESIDUAL_TMP(IZ,IX,IY) = REAL(G%IMASK(IZ,IX,IY))*ABS(G%TPN(IZ,IX,IY) - TPNOLD(IZ,IX,IY))
+   IF (G%RESIDUAL_TMP(IZ,IX,IY) .GT. GPG%TMPTOL*ALPHA_H) CONVERGED_TMP(IZ,IX,IY) = .FALSE. 
+   IF (G%TPN(IZ,IX,IY).NE.G%TPN(IZ,IX,IY) .OR. G%TPN(IZ,IX,IY).EQ.GPG%POSINF .OR. G%TPN(IZ,IX,IY).EQ.GPG%NEGINF) THEN
+      CONVERGED_TMP(IZ,IX,IY) = .FALSE.
+      GPG%NAN = .TRUE.
+   ENDIF
+ENDDO
+ENDDO
+ENDDO
+!$omp END PARALLEL DO
+
+
+CALL GET_CPU_TIME(TEND)
+GPG%TUSED(1) = GPG%TUSED(1) + TEND - TMID2 
+
+! *****************************************************************************
+END SUBROUTINE SOLID_ENTHALPY_SOLVER_ANISOTROPIC
+! ************************************************************
+
+! *****************************************************************************
+SUBROUTINE PRESSURE_SOLVER(IMESH,NCELLZ,NCELLX,NCELLY,DTIME,CONVERGED_P,ALPHA_P,ITER)
+! *****************************************************************************
+
+INTEGER, INTENT(IN) :: IMESH,NCELLZ,NCELLX,NCELLY,ITER
+REAL(EB), INTENT(IN) :: DTIME,ALPHA_P
+LOGICAL, INTENT(OUT), DIMENSION(1:NCELLZ,1:NCELLX,1:NCELLY) :: CONVERGED_P
+
+INTEGER :: IZ,IX,IY,IGSPEC
+REAL(EB), POINTER, DIMENSION(:,:,:) :: AP0N,AP0,AP,AB,AT,AE,AW,AN,AS,B,MOR,MORN,PNOLD,PTR,BX,BY !,BZ
+REAL(EB) :: TSTART,TEND,DPMAX
+REAL(EB), PARAMETER :: EPS_P = 0.01D0
+
+CALL GET_CPU_TIME(TSTART)
+
+AP0N   => G%RWORK01
+AP0    => G%RWORK02
+AP     => G%RWORK03
+AB     => G%RWORK04
+AT     => G%RWORK05
+AE     => G%RWORK06
+AW     => G%RWORK07
+AN     => G%RWORK08
+AS     => G%RWORK09
+B      => G%RWORK10
+MOR    => G%RWORK11
+MORN   => G%RWORK12
+PNOLD  => G%RWORK13
+BX     => G%RWORK14
+BY     => G%RWORK16
+!BZ     => G%RWORK18
+
+G=>GPM(IMESH)
+GPBCP(1:,1:,1:,-3:)=>G%GPYRO_BOUNDARY_CONDITION(1:,1:,1:,-3:)
+
+! Calculate M/R and M/R (next)
+IF (GPG%SOLVE_GAS_YJ) THEN
+   MOR   (:,:,:) = 0D0
+   MORN  (:,:,:) = 0D0
+!$omp PARALLEL DO SCHEDULE(STATIC)
+   DO IY = 1, NCELLY
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+   DO IGSPEC = 1, GPROP%NGSPEC
+      MORN(IZ,IX,IY) = MORN(IZ,IX,IY) + G%YJGN(IGSPEC,IZ,IX,IY) * GPROP%M(IGSPEC) / 8314.
+      MOR (IZ,IX,IY) = MOR (IZ,IX,IY) + G%YJG (IGSPEC,IZ,IX,IY) * GPROP%M(IGSPEC) / 8314.
+   ENDDO
+   ENDDO
+   ENDDO
+   ENDDO
+ELSE
+   MORN(:,:,:) = GPROP%M(1) / 8314.
+   MOR (:,:,:) = MORN(:,:,:)
+ENDIF
+
+IF (GPG%SOLVE_GAS_ENERGY .AND. (.NOT. GPG%THERMAL_EQUILIBRIUM) ) THEN
+!$omp PARALLEL DO SCHEDULE(STATIC)
+   DO IY = 1, NCELLY
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+      AP0 (IZ,IX,IY) = MOR (IZ,IX,IY) * G%POROSS (IZ,IX,IY) * G%DLTZ (IZ,IX,IY) * G%DLTX (IZ,IX,IY) * G%DLTY (IZ,IX,IY) / (G%TG (IZ,IX,IY) * DTIME)
+      AP0N(IZ,IX,IY) = MORN(IZ,IX,IY) * G%POROSSN(IZ,IX,IY) * G%DLTZN(IZ,IX,IY) * G%DLTXN(IZ,IX,IY) * G%DLTYN(IZ,IX,IY) / (G%TGN(IZ,IX,IY) * DTIME)
+   ENDDO
+   ENDDO
+   ENDDO
+!$omp END PARALLEL DO
+ELSE
+!$omp PARALLEL DO SCHEDULE(STATIC)
+   DO IY = 1, NCELLY
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+      AP0 (IZ,IX,IY) = MOR (IZ,IX,IY) * G%POROSS (IZ,IX,IY) * G%DLTZ (IZ,IX,IY) * G%DLTX (IZ,IX,IY) * G%DLTY (IZ,IX,IY) / (G%TP (IZ,IX,IY) * DTIME)
+      AP0N(IZ,IX,IY) = MORN(IZ,IX,IY) * G%POROSSN(IZ,IX,IY) * G%DLTZN(IZ,IX,IY) * G%DLTXN(IZ,IX,IY) * G%DLTYN(IZ,IX,IY) / (G%TPN(IZ,IX,IY) * DTIME)
+   ENDDO
+   ENDDO
+   ENDDO
+!$omp END PARALLEL DO
+ENDIF
+
+! Specify coefficients for TDMA
+AB(:,:,:) = 0D0; AT(:,:,:) = 0D0
+AE(:,:,:) = 0D0; AW(:,:,:) = 0D0
+AN(:,:,:) = 0D0; AS(:,:,:) = 0D0
+
+!$omp PARALLEL DO SCHEDULE(STATIC)
+DO IY = 1, NCELLY
+DO IX = 1, NCELLX
+DO IZ = 1, NCELLZ
+   IF (G%IMASK(IZ,IX,IY) .NE. 0) THEN
+      AB(IZ,IX,IY) = G%PERMONUB(IZ,IX,IY) * G%DXDY(IZ,IX,IY) / G%DZB(IZ,IX,IY)
+      AT(IZ,IX,IY) = G%PERMONUT(IZ,IX,IY) * G%DXDY(IZ,IX,IY) / G%DZT(IZ,IX,IY)
+      AE(IZ,IX,IY) = G%PERMONUE(IZ,IX,IY) * G%DYDZ(IZ,IX,IY) / G%DXE(IZ,IX,IY)
+      AW(IZ,IX,IY) = G%PERMONUW(IZ,IX,IY) * G%DYDZ(IZ,IX,IY) / G%DXW(IZ,IX,IY)
+      AN(IZ,IX,IY) = G%PERMONUN(IZ,IX,IY) * G%DXDZ(IZ,IX,IY) / G%DYN(IZ,IX,IY)
+      AS(IZ,IX,IY) = G%PERMONUS(IZ,IX,IY) * G%DXDZ(IZ,IX,IY) / G%DYS(IZ,IX,IY)
+   ENDIF
+ENDDO
+ENDDO
+ENDDO
+!$omp END PARALLEL DO 
+
+! Set AP and B
+!$omp PARALLEL DO SCHEDULE(STATIC) COLLAPSE(3)
+DO IY = 1, NCELLY
+DO IX = 1, NCELLX
+DO IZ = 1, NCELLZ
+
+   IF (G%IMASK(IZ,IX,IY) .NE. 0) THEN
+      AP(IZ,IX,IY) = AP0(IZ,IX,IY) + AB(IZ,IX,IY) + AT(IZ,IX,IY) + &
+                                     AE(IZ,IX,IY) + AW(IZ,IX,IY) + &
+                                     AN(IZ,IX,IY) + AS(IZ,IX,IY)
+      B (IZ,IX,IY) = AP0(IZ,IX,IY) * G%P(IZ,IX,IY) + &
+                    (AP0(IZ,IX,IY) - AP0N(IZ,IX,IY)) * G%PN(IZ,IX,IY) + &
+                     G%OMEGASFG(IZ,IX,IY) * G%DLTZN(IZ,IX,IY) * G%DLTXN(IZ,IX,IY) * G%DLTYN(IZ,IX,IY)
+   ELSE
+      AP(IZ,IX,IY)=1D0
+      B (IZ,IX,IY)=GPG%P0
+   ENDIF
+
+ENDDO
+ENDDO
+ENDDO
+!$omp END PARALLEL DO
+
+! Apply boundary conditions
+!$omp PARALLEL DO SCHEDULE(DYNAMIC,4)
+DO IY = 1, NCELLY
+DO IX = 1, NCELLX
+DO IZ = 1, NCELLZ
+
+   IF (G%NEEDSBCT(IZ,IX,IY)) THEN !Set top boundary condition:
+      IF (GPBCP(IZ,IX,IY,-3)%PRES .LT. 0D0) THEN
+         B(IZ,IX,IY) = B(IZ,IX,IY) + 1D-3*GPBCP(IZ,IX,IY,-3)%MFLUX*G%DXDY(IZ,IX,IY)
+      ELSE 
+         CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AB(IZ,IX,IY),AT(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY,-3)%PRES)
+      ENDIF
+   ENDIF
+
+   IF (G%NEEDSBCB(IZ,IX,IY)) THEN !Set bottom boundary condition:
+      IF (GPBCP(IZ,IX,IY, 3)%PRES .LT. 0D0) THEN
+         B(IZ,IX,IY) = B(IZ,IX,IY) + 1D-3*GPBCP(IZ,IX,IY, 3)%MFLUX*G%DXDY(IZ,IX,IY)
+      ELSE 
+         CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AB(IZ,IX,IY),AT(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY, 3)%PRES)
+      ENDIF
+   ENDIF
+
+   IF (G%NEEDSBCW(IZ,IX,IY)) THEN !Set west boundary condition:
+      IF (GPBCP(IZ,IX,IY,-1)%PRES .LT. 0D0) THEN
+         B(IZ,IX,IY) = B(IZ,IX,IY) + 1D-3*GPBCP(IZ,IX,IY,-1)%MFLUX*G%DYDZ(IZ,IX,IY)
+      ELSE 
+         CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AB(IZ,IX,IY),AT(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY,-1)%PRES)
+      ENDIF
+   ENDIF
+
+   IF (G%NEEDSBCE(IZ,IX,IY)) THEN !Set east boundary condition:
+      IF (GPBCP(IZ,IX,IY, 1)%PRES .LT. 0D0) THEN
+         B(IZ,IX,IY) = B(IZ,IX,IY) + 1D-3*GPBCP(IZ,IX,IY, 1)%MFLUX*G%DYDZ(IZ,IX,IY)
+      ELSE 
+         CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AB(IZ,IX,IY),AT(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY, 1)%PRES)
+      ENDIF
+   ENDIF
+
+   IF (G%NEEDSBCS(IZ,IX,IY)) THEN !Set south boundary condition:
+      IF (GPBCP(IZ,IX,IY,-2)%PRES .LT. 0D0) THEN
+         B(IZ,IX,IY) = B(IZ,IX,IY) + 1D-3*GPBCP(IZ,IX,IY,-2)%MFLUX*G%DXDZ(IZ,IX,IY)
+      ELSE 
+         CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AB(IZ,IX,IY),AT(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY,-2)%PRES)
+      ENDIF
+   ENDIF
+
+   IF (G%NEEDSBCN(IZ,IX,IY)) THEN !Set north boundary condition:
+      IF (GPBCP(IZ,IX,IY, 2)%PRES .LT. 0D0) THEN
+        B(IZ,IX,IY) = B(IZ,IX,IY) + 1D-3*GPBCP(IZ,IX,IY, 2)%MFLUX*G%DXDZ(IZ,IX,IY)
+      ELSE 
+         CALL SET_BC_FIXED_VALUE(AP(IZ,IX,IY),AB(IZ,IX,IY),AT(IZ,IX,IY),AE(IZ,IX,IY),AW(IZ,IX,IY),AN(IZ,IX,IY),AS(IZ,IX,IY),B(IZ,IX,IY),GPBCP(IZ,IX,IY, 2)%PRES)
+      ENDIF
+   ENDIF
+
+ENDDO
+ENDDO
+ENDDO
+!$omp END PARALLEL DO
+
+! Add terms for 2D/3D:
+DO IY = 1, NCELLY
+DO IX = 1, NCELLX
+DO IZ = 1, NCELLZ
+   BX(IZ,IX,IY) = 0D0; BY(IZ,IX,IY) = 0D0
+   IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+   IF ((.NOT. G%NEEDSBCW(IZ,IX,IY)) .AND. IX .NE. 1     ) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AW(IZ,IX,IY)*G%PN(IZ,IX-1,IY)
+   IF ((.NOT. G%NEEDSBCE(IZ,IX,IY)) .AND. IX .NE. NCELLX) BX(IZ,IX,IY) = BX(IZ,IX,IY) + AE(IZ,IX,IY)*G%PN(IZ,IX+1,IY)
+   IF ((.NOT. G%NEEDSBCS(IZ,IX,IY)) .AND. IY .NE. 1     ) BY(IZ,IX,IY) = BY(IZ,IX,IY) + AS(IZ,IX,IY)*G%PN(IZ,IX,IY-1)
+   IF ((.NOT. G%NEEDSBCN(IZ,IX,IY)) .AND. IY .NE. NCELLY) BY(IZ,IX,IY) = BY(IZ,IX,IY) + AN(IZ,IX,IY)*G%PN(IZ,IX,IY+1)
+ENDDO
+ENDDO
+ENDDO
+
+   PNOLD(:,:,:) = G%PN(:,:,:)
+! z-direction sweep
+!$omp PARALLEL DO SCHEDULE(STATIC) COLLAPSE(3)
+DO IX = 1, NCELLX
+DO IY = 1, NCELLY
+DO IZ = 1, NCELLZ
+   AP(IZ,IX,IY) = AP(IZ,IX,IY) / ALPHA_P
+   B (IZ,IX,IY) = B (IZ,IX,IY) + BX(IZ,IX,IY) + BY(IZ,IX,IY) + AP(IZ,IX,IY) * PNOLD(IZ,IX,IY) * (1D0 - ALPHA_P) 
+ENDDO
+ENDDO
+ENDDO
+
+PTR => G%PN
+DO IX = 1, NCELLX
+DO IY = 1, NCELLY
+   CALL TDMA_SOLVER_GENERAL(NCELLZ,PTR(:,IX,IY),AP(:,IX,IY),AB(:,IX,IY),AT(:,IX,IY),B(:,IX,IY))
+ENDDO
+ENDDO
+
+! Check convergence - RELATIVE TOLERANCE
+
+CONVERGED_P(:,:,:) = .TRUE.
+DPMAX = MAX(MAXVAL(ABS(PNOLD(:,:,:) - GPG%P0)), EPS_P)
+
+!$omp PARALLEL DO SCHEDULE(STATIC)
+DO IY = 1, NCELLY
+DO IX = 1, NCELLX
+DO IZ = 1, NCELLZ
+   G%RESIDUAL_P(IZ,IX,IY) = REAL(G%IMASK(IZ,IX,IY))*ABS(G%PN(IZ,IX,IY) - PNOLD(IZ,IX,IY)) / DPMAX
+   IF (G%RESIDUAL_P(IZ,IX,IY) .GT. GPG%PTOL*ALPHA_P) CONVERGED_P(IZ,IX,IY) = .FALSE.
+   IF (G%PN(IZ,IX,IY).NE.G%PN(IZ,IX,IY) .OR. G%PN(IZ,IX,IY).EQ.GPG%POSINF .OR. G%PN(IZ,IX,IY).EQ.GPG%NEGINF) THEN
+      GPG%NAN = .TRUE.
+      CONVERGED_P(IZ,IX,IY) = .FALSE.
+   ENDIF
+ENDDO
+ENDDO
+ENDDO
+!$omp END PARALLEL DO
+
+CALL GET_CPU_TIME(TEND)
+GPG%TUSED(6) = GPG%TUSED(6) + TEND - TSTART 
+
+! *****************************************************************************
+END SUBROUTINE PRESSURE_SOLVER
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE DARCIAN_MASS_FLUX(IMESH,NCELLZ,NCELLX,NCELLY,DIRECTION)
+! *****************************************************************************
+! Calculate flow rate from pressure gradient
+
+INTEGER, INTENT(IN) :: IMESH,NCELLZ,NCELLX,NCELLY
+CHARACTER(1), INTENT(IN) :: DIRECTION
+INTEGER :: IZ,IX,IY
+REAL(EB) :: DPDZMRG,DPDXMRG,DPDYMRG
+REAL(EB) :: TSTART, TEND
+
+CALL GET_CPU_TIME(TSTART)
+
+G=>GPM(IMESH)
+GPBCP(1:,1:,1:,-3:)=>G%GPYRO_BOUNDARY_CONDITION(1:,1:,1:,-3:)
+
+SELECT CASE(DIRECTION) 
+
+   CASE ('Z')
+      DO IY = 1, NCELLY
+      DO IX = 1, NCELLX
+         DO IZ = 1, NCELLZ-1 !Calculate z-direction mass flux (bottom)
+            DPDZMRG = (G%PN(IZ+1,IX,IY) - G%PN(IZ,IX,IY)) / G%DZB(IZ,IX,IY) !- G%RGNB(IZ,IX,IY)*G%GZ  
+            G%MDOTPPDARCYB(IZ,IX,IY) = -G%PERMONUB(IZ,IX,IY) * DPDZMRG
+         ENDDO
+         
+         DO IZ = 2, NCELLZ !Set z-direction mass flux (top) from bottom values:
+            G%MDOTPPDARCYT(IZ,IX,IY) = G%MDOTPPDARCYB(IZ-1,IX,IY)
+         ENDDO
+         
+         !here, we still need the top value for cell 1 and the bottom value for cell NCELLZ
+         !For now, make this approximation:
+         G%MDOTPPDARCYT(1     ,IX,IY) = G%MDOTPPDARCYB(1     ,IX,IY)         
+         G%MDOTPPDARCYB(NCELLZ,IX,IY) = G%MDOTPPDARCYT(NCELLZ,IX,IY)
+      ENDDO
+      ENDDO
+      
+   CASE('X')
+      DO IY = 1, NCELLY
+      DO IZ = 1, NCELLZ
+         DO IX = 1, NCELLX-1 !Calculate x-direction mass flux (east)
+            DPDXMRG = (G%PN(IZ,IX+1,IY) - G%PN(IZ,IX,IY)) / G%DXE(IZ,IX,IY) !- G%RGNE(IZ,IX,IY)*G%GX  
+            G%MDOTPPDARCYE(IZ,IX,IY) = -G%PERMONUE(IZ,IX,IY) * DPDXMRG
+         ENDDO
+         
+         DO IX = 2, NCELLX !Set x-direction mass flux (west) from east values:
+            G%MDOTPPDARCYW(IZ,IX,IY) = G%MDOTPPDARCYE(IZ,IX-1,IY)
+         ENDDO
+         
+         !here, we still need the west value for cell 1 and the east value for cell NCELLX
+         !For now, make this approximation:
+         G%MDOTPPDARCYW(IZ,1     ,IY) = G%MDOTPPDARCYE(IZ,1     ,IY)         
+         G%MDOTPPDARCYE(IZ,NCELLX,IY) = G%MDOTPPDARCYW(IZ,NCELLX,IY)
+      ENDDO
+      ENDDO
+   
+   CASE('Y')
+      DO IX = 1, NCELLX
+      DO IZ = 1, NCELLZ
+         DO IY = 1, NCELLY-1 !Calculate y-direction mass flux (north)
+            DPDYMRG = (G%PN(IZ,IX,IY+1) - G%PN(IZ,IX,IY)) / G%DYN(IZ,IX,IY) !- G%RGNN(IZ,IX,IY)*G%GY  
+            G%MDOTPPDARCYN(IZ,IX,IY) = -G%PERMONUN(IZ,IX,IY) * DPDYMRG
+         ENDDO
+         
+         DO IY = 2, NCELLY !Set y-direction mass flux (south) from north values:
+            G%MDOTPPDARCYS(IZ,IX,IY) = G%MDOTPPDARCYN(IZ,IX,IY-1)
+         ENDDO
+         
+         !here, we still need the south value for cell 1 and the north value for cell NCELLY
+         !For now, make this approximation:
+         G%MDOTPPDARCYS(IZ,IX,1     ) = G%MDOTPPDARCYN(IZ,IX,1     )         
+         G%MDOTPPDARCYN(IZ,IX,NCELLY) = G%MDOTPPDARCYS(IZ,IX,NCELLY)
+      ENDDO
+      ENDDO
+
+CALL GET_CPU_TIME(TEND)
+GPG%TUSED(26) = GPG%TUSED(26) + TEND - TSTART 
+
+END SELECT
+
+! *****************************************************************************
+END SUBROUTINE DARCIAN_MASS_FLUX
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE CONVECTIVE_DIFFUSIVE_SOLVER_NEW(IMESH,NGSPEC,NCELLZ,NCELLX,NCELLY,ISCHEME,ITER,DTIME, &
+           CONVERGED_YJG,ALPHA_YJG,UPDATE_COEFFS)
+! *****************************************************************************
+
+INTEGER, INTENT(IN) :: IMESH,NGSPEC,NCELLZ,NCELLX,NCELLY,ISCHEME,ITER
+LOGICAL, INTENT(OUT), DIMENSION(0:NGSPEC,1:NCELLZ,1:NCELLX,1:NCELLY) :: CONVERGED_YJG
+REAL(EB), INTENT(IN) :: DTIME, ALPHA_YJG
+LOGICAL, INTENT(IN) :: UPDATE_COEFFS
+LOGICAL :: SWEEPZ, SWEEPX, SWEEPY
+INTEGER :: I,IZ,IX,IY,IGSPEC
+REAL(EB) :: TSTART,TEND,RESIDABS,OMALPHA_YJG,RALPHA_YJG,RDTIME,YJSUM,SOURCE
+REAL(EB), PARAMETER :: EPS = 1D-6
+REAL(EB), POINTER, DIMENSION(:,:,:) :: DT,DB,PT,PB,BIGAT,BIGAB,MDOTPPT,MDOTPPB,AP0,AP,AB,AT,B, &
+                             MDOTPPE,MDOTPPW,DE,DW,PW,PE,AW,AE,BIGAW,BIGAE, &
+                             AN,AS,MDOTPPN,MDOTPPS,DN,DS,PS,PN,BIGAS,BIGAN,AWIXW,AEIXE,ASIYS,ANIYN, &
+                             ATIZT,ABIZB,PTR,BZ,BX,BY,BBC,AP1,APTOT,BTOT
+REAL(EB), POINTER, DIMENSION(:,:,:,:) :: YJGNOLD,AP0YJG,GOMEGA3DXDYDZ
+
+CALL GET_CPU_TIME(TSTART)
+
+G=>GPM(IMESH)
+GPBCP(1:,1:,1:,-3:)=>G%GPYRO_BOUNDARY_CONDITION(1:,1:,1:,-3:)
+OMALPHA_YJG = 1D0 - ALPHA_YJG
+RALPHA_YJG  = 1D0 / ALPHA_YJG
+RDTIME      = 1D0 / DTIME
+
+PT      => G%RWORK01
+PB      => G%RWORK02
+BIGAT   => G%RWORK03
+BIGAB   => G%RWORK04
+B       => G%RWORK05
+MDOTPPE => G%RWORK06
+MDOTPPW => G%RWORK07
+DE      => G%RWORK08
+DW      => G%RWORK09
+PW      => G%RWORK10
+PE      => G%RWORK11
+BIGAW   => G%RWORK12
+BIGAE   => G%RWORK13
+MDOTPPN => G%RWORK14
+MDOTPPS => G%RWORK15
+DN      => G%RWORK16
+DS      => G%RWORK17
+PS      => G%RWORK18
+PN      => G%RWORK19
+BIGAS   => G%RWORK20
+BIGAN   => G%RWORK21
+BZ      => G%RWORK22
+BX      => G%RWORK23
+BY      => G%RWORK24
+BBC     => G%RWORK25
+APTOT   => G%RWORK26
+BTOT    => G%RWORK27
+
+AP0     => G%RWORK28
+AP      => G%RWORK29
+AB      => G%RWORK30
+AT      => G%RWORK31
+AW      => G%RWORK32
+AE      => G%RWORK33
+AN      => G%RWORK34
+AS      => G%RWORK35
+
+AWIXW   => G%RWORK36
+AEIXE   => G%RWORK37
+ASIYS   => G%RWORK38
+ANIYN   => G%RWORK39
+ATIZT   => G%RWORK40
+ABIZB   => G%RWORK41
+AP1     => G%RWORK42
+
+DT      => G%RWORK43
+DB      => G%RWORK44
+MDOTPPT => G%RWORK45
+MDOTPPB => G%RWORK46
+
+YJGNOLD         => G%RWORK110
+AP0YJG          => G%RWORK111
+GOMEGA3DXDYDZ   => G%RWORK112
+
+! Vary sweep direction across iterations 
+SWEEPZ = .FALSE.
+SWEEPX = .FALSE. 
+SWEEPY = .FALSE. 
+
+IF (ITER .EQ. 1) THEN
+   IF (NCELLZ .GT. 1) SWEEPZ = .TRUE. 
+   IF (NCELLX .GT. 1) SWEEPX = .TRUE. 
+   IF (NCELLY .GT. 1) SWEEPY = .TRUE. 
+ELSE
+   IF (NCELLX .EQ. 1 .AND. NCELLY .EQ. 1) SWEEPZ = .TRUE. 
+
+   IF (NCELLX .GT. 1 .AND. NCELLY .EQ. 1) THEN
+      IF (MOD(ITER,2) .EQ. 0) THEN
+         SWEEPZ = .TRUE. 
+      ELSE
+         SWEEPX = .TRUE. 
+      ENDIF
+   ENDIF
+
+   IF (NCELLX .GT. 1 .AND. NCELLY .GT. 1) THEN
+      IF (MOD(ITER,3) .EQ. 2) SWEEPZ = .TRUE. 
+      IF (MOD(ITER,3) .EQ. 0) SWEEPX = .TRUE. 
+      IF (MOD(ITER,3) .EQ. 1) SWEEPY = .TRUE. 
+   ENDIF
+ENDIF
+
+! Override this and just sweep in z:
+SWEEPZ=.TRUE.
+SWEEPX=.FALSE.
+SWEEPY=.FALSE.
+
+IF (GPG%SOLVE_PRESSURE) THEN
+   MDOTPPT(:,:,:) =  G%MDOTPPDARCYT(:,:,:)
+   MDOTPPB(:,:,:) =  G%MDOTPPDARCYB(:,:,:)
+
+   IF (NCELLX .GT. 1) THEN
+      MDOTPPE(:,:,:) = G%MDOTPPDARCYE(:,:,:)
+      MDOTPPW(:,:,:) = G%MDOTPPDARCYW(:,:,:)
+   ENDIF
+
+   IF (NCELLX .GT. 1 .AND. NCELLY .GT. 1) THEN
+      MDOTPPN(:,:,:) = G%MDOTPPDARCYN(:,:,:)
+      MDOTPPS(:,:,:) = G%MDOTPPDARCYS(:,:,:)
+   ENDIF
+
+ELSE
+   MDOTPPT(:,:,:) = -G%MDOTPPZ(0,:,:,:)
+   DO IZ = 1, NCELLZ-1
+      MDOTPPB(IZ,:,:) = MDOTPPT(IZ+1,:,:)
+   ENDDO   
+   MDOTPPB(NCELLZ,:,:) = MDOTPPB(NCELLZ-1,:,:) !THIS APPROXIMATION SHOULD BE FIXED
+
+   IF (NCELLX .GT. 1) THEN
+      MDOTPPE(:,:,:) = 0D0
+      MDOTPPW(:,:,:) = 0D0
+   ENDIF
+
+   IF (NCELLX .GT. 1 .AND. NCELLY .GT. 1) THEN
+      MDOTPPN(:,:,:) = 0D0
+      MDOTPPS(:,:,:) = 0D0
+   ENDIF
+ENDIF         
+
+! On first iteration, calculate quantities that depend on old values (AP0 and AP0*Yjg)
+IF (ITER .EQ. 1) THEN
+   DO IY = 1, NCELLY
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+      IF (G%IMASK(IZ,IX,IY) .EQ. 0) THEN
+         AP(IZ,IX,IY) = 1D0
+         AB(IZ,IX,IY) = 0D0 ; AT(IZ,IX,IY) = 0D0 
+         AE(IZ,IX,IY) = 0D0 ; AW(IZ,IX,IY) = 0D0 
+         AN(IZ,IX,IY) = 0D0 ; AS(IZ,IX,IY) = 0D0 
+      ELSE
+         AP0(IZ,IX,IY) = G%RG(IZ,IX,IY)*G%DXDYDZ(IZ,IX,IY)*G%POROSS(IZ,IX,IY) * RDTIME
+         DO IGSPEC = 1, NGSPEC
+            AP0YJG(IGSPEC,IZ,IX,IY) = AP0(IZ,IX,IY)*G%YJG(IGSPEC,IZ,IX,IY)
+         ENDDO
+      ENDIF
+   ENDDO
+   ENDDO
+   ENDDO
+ENDIF
+
+! Set the effective front and back face diffusion coefficients
+! Note that HM0 is set appropriately in subroutine GET_ALL_BOUNDARY_CONDITIONS
+
+IF (NCELLZ .GT. 1 .AND. NCELLX .EQ. 1 .AND. NCELLY .EQ. 1) THEN
+   IX=1; IY=1
+   IF (UPDATE_COEFFS) THEN
+!$omp PARALLEL DO SCHEDULE(STATIC)
+      DO IZ = 1, NCELLZ
+         IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+
+! Calculate "D", equal to diffusion coefficient divided by grid spacing
+         DT(IZ,IX,IY) = G%PSIRGDT(IZ,IX,IY) / G%DZT(IZ,IX,IY)
+         DB(IZ,IX,IY) = G%PSIRGDB(IZ,IX,IY) / G%DZB(IZ,IX,IY)
+         IF (G%NEEDSBCT(IZ,IX,IY)) THEN
+            IF (GPG%USE_TORTUOSITY_FACTOR_FOR_FLUX) THEN
+               DT(IZ,IX,IY) = GPG%TORTUOSITY_FACTOR*GPBCP(IZ,IX,IY,-3)%HM0 !Set front-face boundary condition
+            ELSE
+               DT(IZ,IX,IY) = GPBCP(IZ,IX,IY,-3)%HM0 !Set front-face boundary condition
+            ENDIF
+         ENDIF
+         IF (G%NEEDSBCB(IZ,IX,IY)) THEN
+            IF (GPG%USE_TORTUOSITY_FACTOR_FOR_FLUX) THEN
+               DB(IZ,IX,IY) = GPG%TORTUOSITY_FACTOR*GPBCP(IZ,IX,IY, 3)%HM0 !Set back-face boundary condition
+            ELSE
+               DB(IZ,IX,IY) = GPBCP(IZ,IX,IY, 3)%HM0 !Set back-face boundary condition
+            ENDIF
+         ENDIF
+         IF (DT(IZ,IX,IY) .LT. 1D-50) DT(IZ,IX,IY) = 1D-50
+         IF (DB(IZ,IX,IY) .LT. 1D-50) DB(IZ,IX,IY) = 1D-50
+
+! Calculate cell Peclet number
+         PT(IZ,IX,IY) = MDOTPPT(IZ,IX,IY) / DT(IZ,IX,IY)
+         PB(IZ,IX,IY) = MDOTPPB(IZ,IX,IY) / DB(IZ,IX,IY)
+         CALL GET_A_SINGLE(ISCHEME,PT(IZ,IX,IY),PB(IZ,IX,IY),BIGAT(IZ,IX,IY),BIGAB(IZ,IX,IY)) ! Calculate A(|P|)
+         AT(IZ,IX,IY) = (DT(IZ,IX,IY) * BIGAT(IZ,IX,IY) + MAX ( MDOTPPT(IZ,IX,IY), 0D0)) * G%DXDY(IZ,IX,IY)
+         AB(IZ,IX,IY) = (DB(IZ,IX,IY) * BIGAB(IZ,IX,IY) + MAX (-MDOTPPB(IZ,IX,IY), 0D0)) * G%DXDY(IZ,IX,IY)
+
+         IF (G%NEEDSBCT(IZ,IX,IY)) THEN
+            ATIZT(IZ,IX,IY) = AT(IZ,IX,IY)
+            AT   (IZ,IX,IY) = 0D0
+         ENDIF
+
+         IF (G%NEEDSBCB(IZ,IX,IY)) THEN
+            ABIZB(IZ,IX,IY) = AB(IZ,IX,IY)
+            AB   (IZ,IX,IY) = 0D0
+         ENDIF
+      ENDDO
+!$omp END PARALLEL DO
+   ENDIF !UPDATE_COEFFS
+
+   DO IZ = 1, NCELLZ
+      IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+      AP1(IZ,IX,IY) = AP0(IZ,IX,IY) + G%OMEGASFG(IZ,IX,IY)*G%DXDYDZ(IZ,IX,IY) + AT(IZ,IX,IY) + AB(IZ,IX,IY)
+      DO IGSPEC = 1, NGSPEC
+         GOMEGA3DXDYDZ(IGSPEC,IZ,IX,IY) = G%GOMEGA(3,IGSPEC,IZ,IX,IY) * G%DXDYDZ(IZ,IX,IY)
+      ENDDO
+   ENDDO
+
+ENDIF
+
+IF (NCELLZ .GT. 1 .AND. NCELLX .GT. 1 .AND. NCELLY .EQ. 1) THEN
+   IY = 1
+   IF (UPDATE_COEFFS) THEN
+!$omp PARALLEL DO SCHEDULE(STATIC)
+      DO IX = 1, NCELLX
+      DO IZ = 1, NCELLZ
+
+         IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+
+! Calculate "D", equal to diffusion coefficient divided by grid spacing
+         DT(IZ,IX,IY) = G%PSIRGDT(IZ,IX,IY) / G%DZT(IZ,IX,IY)
+         DB(IZ,IX,IY) = G%PSIRGDB(IZ,IX,IY) / G%DZB(IZ,IX,IY)
+         IF (G%NEEDSBCT(IZ,IX,IY)) THEN
+            IF (GPG%USE_TORTUOSITY_FACTOR_FOR_FLUX) THEN
+               DT(IZ,IX,IY) = GPG%TORTUOSITY_FACTOR*GPBCP(IZ,IX,IY,-3)%HM0 !Set front-face boundary condition
+            ELSE
+               DT(IZ,IX,IY) = GPBCP(IZ,IX,IY,-3)%HM0 !Set front-face boundary condition
+            ENDIF
+         ENDIF
+         IF (G%NEEDSBCB(IZ,IX,IY)) THEN
+            IF (GPG%USE_TORTUOSITY_FACTOR_FOR_FLUX) THEN
+               DB(IZ,IX,IY) = GPG%TORTUOSITY_FACTOR*GPBCP(IZ,IX,IY, 3)%HM0 !Set back-face boundary condition
+            ELSE
+               DB(IZ,IX,IY) = GPBCP(IZ,IX,IY, 3)%HM0 !Set back-face boundary condition
+            ENDIF
+         ENDIF
+         IF (DT(IZ,IX,IY) .LT. 1D-50) DT(IZ,IX,IY) = 1D-50
+         IF (DB(IZ,IX,IY) .LT. 1D-50) DB(IZ,IX,IY) = 1D-50
+
+! Calculate cell Peclet number
+         PT(IZ,IX,IY) = MDOTPPT(IZ,IX,IY) / DT(IZ,IX,IY)
+         PB(IZ,IX,IY) = MDOTPPB(IZ,IX,IY) / DB(IZ,IX,IY)
+         CALL GET_A_SINGLE(ISCHEME,PT(IZ,IX,IY),PB(IZ,IX,IY),BIGAT(IZ,IX,IY),BIGAB(IZ,IX,IY)) ! Calculate A(|P|)
+         AT(IZ,IX,IY) = (DT(IZ,IX,IY) * BIGAT(IZ,IX,IY) + MAX ( MDOTPPT(IZ,IX,IY), 0D0)) * G%DXDY(IZ,IX,IY)
+         AB(IZ,IX,IY) = (DB(IZ,IX,IY) * BIGAB(IZ,IX,IY) + MAX (-MDOTPPB(IZ,IX,IY), 0D0)) * G%DXDY(IZ,IX,IY)
+
+         IF (G%NEEDSBCT(IZ,IX,IY)) THEN
+            ATIZT(IZ,IX,IY) = AT(IZ,IX,IY)
+            AT   (IZ,IX,IY) = 0D0
+         ENDIF
+
+         IF (G%NEEDSBCB(IZ,IX,IY)) THEN
+            ABIZB(IZ,IX,IY) = AB(IZ,IX,IY)
+            AB   (IZ,IX,IY) = 0D0
+         ENDIF
+
+! Calculate "D", equal to diffusion coefficient divided by grid spacing
+         DW(IZ,IX,IY) = G%PSIRGDW(IZ,IX,IY) / G%DXW(IZ,IX,IY)
+         DE(IZ,IX,IY) = G%PSIRGDE(IZ,IX,IY) / G%DXE(IZ,IX,IY)
+         IF (G%NEEDSBCW(IZ,IX,IY)) THEN
+            IF (GPG%USE_TORTUOSITY_FACTOR_FOR_FLUX) THEN
+               DW(IZ,IX,IY) = GPG%TORTUOSITY_FACTOR*GPBCP(IZ,IX,IY,-1)%HM0
+            ELSE
+               DW(IZ,IX,IY) = GPBCP(IZ,IX,IY,-1)%HM0
+            ENDIF
+         ENDIF
+         IF (G%NEEDSBCE(IZ,IX,IY)) THEN
+            IF (GPG%USE_TORTUOSITY_FACTOR_FOR_FLUX) THEN
+               DE(IZ,IX,IY) = GPG%TORTUOSITY_FACTOR*GPBCP(IZ,IX,IY, 1)%HM0
+            ELSE
+               DE(IZ,IX,IY) = GPBCP(IZ,IX,IY, 1)%HM0
+            ENDIF
+         ENDIF
+         IF (DW(IZ,IX,IY) .LT. 1D-50) DW(IZ,IX,IY) = 1D-50
+         IF (DE(IZ,IX,IY) .LT. 1D-50) DE(IZ,IX,IY) = 1D-50
+
+! Calculate cell Peclet number
+         PW(IZ,IX,IY) = MDOTPPW(IZ,IX,IY) / DW(IZ,IX,IY)
+         PE(IZ,IX,IY) = MDOTPPE(IZ,IX,IY) / DE(IZ,IX,IY)
+         CALL GET_A_SINGLE(ISCHEME,PW(IZ,IX,IY),PE(IZ,IX,IY),BIGAW(IZ,IX,IY),BIGAE(IZ,IX,IY)) ! Calculate A(|P|)
+         AW(IZ,IX,IY) = (DW(IZ,IX,IY) * BIGAW(IZ,IX,IY) + MAX ( MDOTPPW(IZ,IX,IY), 0D0) ) * G%DYDZ(IZ,IX,IY)
+         AE(IZ,IX,IY) = (DE(IZ,IX,IY) * BIGAE(IZ,IX,IY) + MAX (-MDOTPPE(IZ,IX,IY), 0D0) ) * G%DYDZ(IZ,IX,IY)
+
+         IF (G%NEEDSBCW(IZ,IX,IY)) THEN 
+            AWIXW(IZ,IX,IY) = AW(IZ,IX,IY)
+            AW(IZ,IX,IY)    = 0D0
+         ENDIF
+
+         IF (G%NEEDSBCE(IZ,IX,IY)) THEN
+            AEIXE(IZ,IX,IY) = AE(IZ,IX,IY)
+            AE(IZ,IX,IY)    = 0D0
+         ENDIF
+
+      ENDDO
+      ENDDO
+!$omp END PARALLEL DO
+   ENDIF !UPDATE_COEFFS
+
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+      IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+
+      AP1(IZ,IX,IY) = AP0(IZ,IX,IY) + G%OMEGASFG(IZ,IX,IY)*G%DXDYDZ(IZ,IX,IY) + AT(IZ,IX,IY) + AB(IZ,IX,IY) + AE(IZ,IX,IY) + AW(IZ,IX,IY)
+      DO IGSPEC = 1, NGSPEC
+         GOMEGA3DXDYDZ(IGSPEC,IZ,IX,IY) = G%GOMEGA(3,IGSPEC,IZ,IX,IY) * G%DXDYDZ(IZ,IX,IY)
+      ENDDO
+   ENDDO
+   ENDDO
+
+ENDIF
+
+IF (NCELLZ .GT. 1 .AND. NCELLX .GT. 1 .AND. NCELLY .GT. 1) THEN
+   IF (UPDATE_COEFFS) THEN
+!$omp PARALLEL DO SCHEDULE(DYNAMIC,4)
+      DO IY = 1, NCELLY
+      DO IX = 1, NCELLX
+      DO IZ = 1, NCELLZ
+
+         IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+
+! Calculate "D", equal to diffusion coefficient divided by grid spacing
+         DT(IZ,IX,IY) = G%PSIRGDT(IZ,IX,IY) / G%DZT(IZ,IX,IY)
+         DB(IZ,IX,IY) = G%PSIRGDB(IZ,IX,IY) / G%DZB(IZ,IX,IY)
+         IF (G%NEEDSBCT(IZ,IX,IY)) THEN
+            IF (GPG%USE_TORTUOSITY_FACTOR_FOR_FLUX) THEN
+               DT(IZ,IX,IY) = GPG%TORTUOSITY_FACTOR*GPBCP(IZ,IX,IY,-3)%HM0 !Set front-face boundary condition
+            ELSE
+               DT(IZ,IX,IY) = GPBCP(IZ,IX,IY,-3)%HM0 !Set front-face boundary condition
+            ENDIF
+         ENDIF
+         IF (G%NEEDSBCB(IZ,IX,IY)) THEN
+            IF (GPG%USE_TORTUOSITY_FACTOR_FOR_FLUX) THEN
+               DB(IZ,IX,IY) = GPG%TORTUOSITY_FACTOR*GPBCP(IZ,IX,IY, 3)%HM0 !Set back-face boundary condition
+            ELSE
+               DB(IZ,IX,IY) = GPBCP(IZ,IX,IY, 3)%HM0 !Set back-face boundary condition
+            ENDIF
+         ENDIF
+         IF (DT(IZ,IX,IY) .LT. 1D-50) DT(IZ,IX,IY) = 1D-50
+         IF (DB(IZ,IX,IY) .LT. 1D-50) DB(IZ,IX,IY) = 1D-50
+
+! Calculate cell Peclet number
+         PT(IZ,IX,IY) = MDOTPPT(IZ,IX,IY) / DT(IZ,IX,IY)
+         PB(IZ,IX,IY) = MDOTPPB(IZ,IX,IY) / DB(IZ,IX,IY)
+         CALL GET_A_SINGLE(ISCHEME,PT(IZ,IX,IY),PB(IZ,IX,IY),BIGAT(IZ,IX,IY),BIGAB(IZ,IX,IY)) ! Calculate A(|P|)
+         AT(IZ,IX,IY) = (DT(IZ,IX,IY) * BIGAT(IZ,IX,IY) + MAX ( MDOTPPT(IZ,IX,IY), 0D0)) * G%DXDY(IZ,IX,IY)
+         AB(IZ,IX,IY) = (DB(IZ,IX,IY) * BIGAB(IZ,IX,IY) + MAX (-MDOTPPB(IZ,IX,IY), 0D0)) * G%DXDY(IZ,IX,IY)
+
+         IF (G%NEEDSBCT(IZ,IX,IY)) THEN
+            ATIZT(IZ,IX,IY) = AT(IZ,IX,IY)
+            AT   (IZ,IX,IY) = 0D0
+         ENDIF
+
+         IF (G%NEEDSBCB(IZ,IX,IY)) THEN
+            ABIZB(IZ,IX,IY) = AB(IZ,IX,IY)
+            AB   (IZ,IX,IY) = 0D0
+         ENDIF
+
+! Calculate "D", equal to diffusion coefficient divided by grid spacing
+         DW(IZ,IX,IY) = G%PSIRGDW(IZ,IX,IY) / G%DXW(IZ,IX,IY)
+         DE(IZ,IX,IY) = G%PSIRGDE(IZ,IX,IY) / G%DXE(IZ,IX,IY)
+         IF (G%NEEDSBCW(IZ,IX,IY)) THEN
+            IF (GPG%USE_TORTUOSITY_FACTOR_FOR_FLUX) THEN
+               DW(IZ,IX,IY) = GPG%TORTUOSITY_FACTOR*GPBCP(IZ,IX,IY,-1)%HM0
+            ELSE
+               DW(IZ,IX,IY) = GPBCP(IZ,IX,IY,-1)%HM0
+            ENDIF
+         ENDIF
+         IF (G%NEEDSBCE(IZ,IX,IY)) THEN
+            IF (GPG%USE_TORTUOSITY_FACTOR_FOR_FLUX) THEN
+               DE(IZ,IX,IY) = GPG%TORTUOSITY_FACTOR*GPBCP(IZ,IX,IY, 1)%HM0
+            ELSE
+               DE(IZ,IX,IY) = GPBCP(IZ,IX,IY, 1)%HM0
+            ENDIF
+         ENDIF
+         IF (DW(IZ,IX,IY) .LT. 1D-50) DW(IZ,IX,IY) = 1D-50
+         IF (DE(IZ,IX,IY) .LT. 1D-50) DE(IZ,IX,IY) = 1D-50
+
+! Calculate cell Peclet number
+         PW(IZ,IX,IY) = MDOTPPW(IZ,IX,IY) / DW(IZ,IX,IY)
+         PE(IZ,IX,IY) = MDOTPPE(IZ,IX,IY) / DE(IZ,IX,IY)
+         CALL GET_A_SINGLE(ISCHEME,PW(IZ,IX,IY),PE(IZ,IX,IY),BIGAW(IZ,IX,IY),BIGAE(IZ,IX,IY)) ! Calculate A(|P|)
+         AW(IZ,IX,IY) = (DW(IZ,IX,IY) * BIGAW(IZ,IX,IY) + MAX ( MDOTPPW(IZ,IX,IY), 0D0) ) * G%DYDZ(IZ,IX,IY)
+         AE(IZ,IX,IY) = (DE(IZ,IX,IY) * BIGAE(IZ,IX,IY) + MAX (-MDOTPPE(IZ,IX,IY), 0D0) ) * G%DYDZ(IZ,IX,IY)
+
+         IF (G%NEEDSBCW(IZ,IX,IY)) THEN 
+            AWIXW(IZ,IX,IY) = AW(IZ,IX,IY)
+            AW(IZ,IX,IY)    = 0D0
+         ENDIF
+
+         IF (G%NEEDSBCE(IZ,IX,IY)) THEN
+            AEIXE(IZ,IX,IY) = AE(IZ,IX,IY)
+            AE(IZ,IX,IY)    = 0D0
+         ENDIF
+
+         DS(IZ,IX,IY) = G%PSIRGDS(IZ,IX,IY) / G%DYS(IZ,IX,IY)
+         DN(IZ,IX,IY) = G%PSIRGDN(IZ,IX,IY) / G%DYN(IZ,IX,IY)
+         IF (G%NEEDSBCS(IZ,IX,IY)) THEN
+            IF (GPG%USE_TORTUOSITY_FACTOR_FOR_FLUX) THEN
+               DS(IZ,IX,IY) = GPG%TORTUOSITY_FACTOR*GPBCP(IZ,IX,IY,-2)%HM0
+            ELSE
+               DS(IZ,IX,IY) = GPBCP(IZ,IX,IY,-2)%HM0
+            ENDIF
+         ENDIF
+         IF (G%NEEDSBCN(IZ,IX,IY)) THEN
+            IF (GPG%USE_TORTUOSITY_FACTOR_FOR_FLUX) THEN
+               DN(IZ,IX,IY) = GPG%TORTUOSITY_FACTOR*GPBCP(IZ,IX,IY, 2)%HM0
+            ELSE
+               DN(IZ,IX,IY) = GPBCP(IZ,IX,IY, 2)%HM0
+            ENDIF
+         ENDIF
+         IF (DS(IZ,IX,IY) .LT. 1D-50) DS(IZ,IX,IY) = 1D-50
+         IF (DN(IZ,IX,IY) .LT. 1D-50) DN(IZ,IX,IY) = 1D-50
+
+! Calculate cell Peclet number
+         PS(IZ,IX,IY) = MDOTPPS(IZ,IX,IY) / DS(IZ,IX,IY)
+         PN(IZ,IX,IY) = MDOTPPN(IZ,IX,IY) / DN(IZ,IX,IY)
+         CALL GET_A_SINGLE(ISCHEME,PS(IZ,IX,IY),PN(IZ,IX,IY),BIGAS(IZ,IX,IY),BIGAN(IZ,IX,IY)) ! Calculate A(|P|)
+         AS(IZ,IX,IY) = (DS(IZ,IX,IY) * BIGAS(IZ,IX,IY) + MAX ( MDOTPPS(IZ,IX,IY), 0D0) ) * G%DXDZ(IZ,IX,IY)
+         AN(IZ,IX,IY) = (DN(IZ,IX,IY) * BIGAN(IZ,IX,IY) + MAX (-MDOTPPN(IZ,IX,IY), 0D0) ) * G%DXDZ(IZ,IX,IY)
+
+         IF (G%NEEDSBCS(IZ,IX,IY)) THEN 
+            ASIYS(IZ,IX,IY)=AS(IZ,IX,IY)
+            AS   (IZ,IX,IY)=0D0
+         ENDIF
+
+         IF (G%NEEDSBCN(IZ,IX,IY)) THEN
+            ANIYN(IZ,IX,IY)=AN(IZ,IX,IY)
+            AN   (IZ,IX,IY)=0D0
+         ENDIF
+
+      ENDDO
+      ENDDO
+      ENDDO
+!$omp END PARALLEL DO
+   ENDIF !UPDATE_COEFFS
+
+   DO IY = 1, NCELLY
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+      IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+      AP1(IZ,IX,IY) = AP0(IZ,IX,IY) + G%OMEGASFG(IZ,IX,IY)*G%DXDYDZ(IZ,IX,IY) + AT(IZ,IX,IY) + AB(IZ,IX,IY) + AE(IZ,IX,IY) + AW(IZ,IX,IY) + AN(IZ,IX,IY) + AS(IZ,IX,IY)
+      DO IGSPEC = 1, NGSPEC
+         GOMEGA3DXDYDZ(IGSPEC,IZ,IX,IY) = G%GOMEGA(3,IGSPEC,IZ,IX,IY) * G%DXDYDZ(IZ,IX,IY)
+      ENDDO
+   ENDDO
+   ENDDO
+   ENDDO
+
+ENDIF
+
+YJGNOLD(:,:,:,:) = G%YJGN(:,:,:,:)
+
+CALL GET_CPU_TIME(TEND)
+GPG%TUSED(9) = GPG%TUSED(9) + TEND - TSTART
+
+! Loop over all gaseous species
+DO IGSPEC = 1, GPROP%NGSPEC
+
+!   IF (ITER .GT. 1 .AND. MAXVAL(G%RESIDUAL_YJG(IGSPEC,:,:,:)*REAL(G%IMASK(:,:,:)))*RALPHA_YJG .LT. 1D-30) CYCLE
+
+   CALL GET_CPU_TIME(TSTART)
+
+   PTR => G%YJGN(IGSPEC,:,:,:) !This is to avoid creating a temporary array in TDMA_SOLVER_GENERAL
+
+! Apply boundary conditions:
+   IF (NCELLZ .GT. 1 .AND. NCELLX .EQ. 1 .AND. NCELLY .EQ. 1) THEN !1D
+      IX=1; IY=1
+      DO IZ = 1, NCELLZ
+         IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+         BBC(IZ,IX,IY) = 0D0
+         IF (G%NEEDSBCT(IZ,IX,IY)) BBC (IZ,IX,IY) = BBC (IZ,IX,IY) + ATIZT(IZ,IX,IY)*(GPBCP(IZ,IX,IY,-3)%YJINF(IGSPEC)-G%YJGN(IGSPEC,IZ,IX,IY))
+         IF (G%NEEDSBCB(IZ,IX,IY)) BBC (IZ,IX,IY) = BBC (IZ,IX,IY) + ABIZB(IZ,IX,IY)*(GPBCP(IZ,IX,IY, 3)%YJINF(IGSPEC)-G%YJGN(IGSPEC,IZ,IX,IY))
+!         IF (G%NEEDSBCT(IZ,IX,IY)) BBC (IZ,IX,IY) = BBC (IZ,IX,IY) + ATIZT(IZ,IX,IY)*(GPBCP(IZ,IX,IY,-3)%YJINF(IGSPEC)-G%YJG (IGSPEC,IZ,IX,IY))
+!         IF (G%NEEDSBCB(IZ,IX,IY)) BBC (IZ,IX,IY) = BBC (IZ,IX,IY) + ABIZB(IZ,IX,IY)*(GPBCP(IZ,IX,IY, 3)%YJINF(IGSPEC)-G%YJG (IGSPEC,IZ,IX,IY))
+
+      ENDDO
+   ENDIF
+
+   IF (NCELLZ .GT. 1 .AND. NCELLX .GT. 1 .AND. NCELLY .EQ. 1) THEN !2D
+      IY=1
+      DO IX = 1, NCELLX
+      DO IZ = 1, NCELLZ
+         IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+         BBC(IZ,IX,IY) = 0D0
+         IF (G%NEEDSBCT(IZ,IX,IY)) BBC (IZ,IX,IY) = BBC (IZ,IX,IY) + ATIZT(IZ,IX,IY)*(GPBCP(IZ,IX,IY,-3)%YJINF(IGSPEC)-G%YJGN(IGSPEC,IZ,IX,IY))
+         IF (G%NEEDSBCB(IZ,IX,IY)) BBC (IZ,IX,IY) = BBC (IZ,IX,IY) + ABIZB(IZ,IX,IY)*(GPBCP(IZ,IX,IY, 3)%YJINF(IGSPEC)-G%YJGN(IGSPEC,IZ,IX,IY))
+         IF (G%NEEDSBCW(IZ,IX,IY)) BBC (IZ,IX,IY) = BBC (IZ,IX,IY) + AWIXW(IZ,IX,IY)*(GPBCP(IZ,IX,IY,-1)%YJINF(IGSPEC)-G%YJGN(IGSPEC,IZ,IX,IY))
+         IF (G%NEEDSBCE(IZ,IX,IY)) BBC (IZ,IX,IY) = BBC (IZ,IX,IY) + AEIXE(IZ,IX,IY)*(GPBCP(IZ,IX,IY, 1)%YJINF(IGSPEC)-G%YJGN(IGSPEC,IZ,IX,IY))
+      ENDDO
+      ENDDO
+   ENDIF
+
+   IF (NCELLZ .GT. 1 .AND. NCELLX .GT. 1 .AND. NCELLY .GT. 1) THEN !3D
+      DO IY = 1, NCELLY
+      DO IX = 1, NCELLX
+      DO IZ = 1, NCELLZ
+         IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+         BBC(IZ,IX,IY) = 0D0
+         IF (G%NEEDSBCT(IZ,IX,IY)) BBC (IZ,IX,IY) = BBC (IZ,IX,IY) + ATIZT(IZ,IX,IY)*(GPBCP(IZ,IX,IY,-3)%YJINF(IGSPEC)-G%YJGN(IGSPEC,IZ,IX,IY))
+         IF (G%NEEDSBCB(IZ,IX,IY)) BBC (IZ,IX,IY) = BBC (IZ,IX,IY) + ABIZB(IZ,IX,IY)*(GPBCP(IZ,IX,IY, 3)%YJINF(IGSPEC)-G%YJGN(IGSPEC,IZ,IX,IY))
+         IF (G%NEEDSBCW(IZ,IX,IY)) BBC (IZ,IX,IY) = BBC (IZ,IX,IY) + AWIXW(IZ,IX,IY)*(GPBCP(IZ,IX,IY,-1)%YJINF(IGSPEC)-G%YJGN(IGSPEC,IZ,IX,IY))
+         IF (G%NEEDSBCE(IZ,IX,IY)) BBC (IZ,IX,IY) = BBC (IZ,IX,IY) + AEIXE(IZ,IX,IY)*(GPBCP(IZ,IX,IY, 1)%YJINF(IGSPEC)-G%YJGN(IGSPEC,IZ,IX,IY))
+         IF (G%NEEDSBCS(IZ,IX,IY)) BBC (IZ,IX,IY) = BBC (IZ,IX,IY) + ASIYS(IZ,IX,IY)*(GPBCP(IZ,IX,IY,-2)%YJINF(IGSPEC)-G%YJGN(IGSPEC,IZ,IX,IY))
+         IF (G%NEEDSBCN(IZ,IX,IY)) BBC (IZ,IX,IY) = BBC (IZ,IX,IY) + ANIYN(IZ,IX,IY)*(GPBCP(IZ,IX,IY, 2)%YJINF(IGSPEC)-G%YJGN(IGSPEC,IZ,IX,IY))
+      ENDDO
+      ENDDO
+      ENDDO
+   ENDIF
+
+   CALL GET_CPU_TIME(TEND)
+   GPG%TUSED(14) = GPG%TUSED(14) + TEND - TSTART
+   CALL GET_CPU_TIME(TSTART)
+
+! Calculate diffusion terms:
+   IF (NCELLZ .GT. 1 .AND. NCELLX .GT. 1 .AND. NCELLY .EQ. 1) THEN !2D
+      IY=1
+
+      IF (SWEEPZ .AND. SWEEPX) THEN
+         DO IX = 1, NCELLX
+         DO IZ = 1, NCELLZ
+            IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+            BZ (IZ,IX,IY) = 0D0; BX (IZ,IX,IY) = 0D0
+            IF ( (.NOT. G%NEEDSBCT(IZ,IX,IY)) .AND. IZ .NE. 1     ) BZ (IZ,IX,IY) = BZ (IZ,IX,IY) + AT(IZ,IX,IY) * G%YJGN(IGSPEC,IZ-1,IX,IY)
+            IF ( (.NOT. G%NEEDSBCB(IZ,IX,IY)) .AND. IZ .NE. NCELLZ) BZ (IZ,IX,IY) = BZ (IZ,IX,IY) + AB(IZ,IX,IY) * G%YJGN(IGSPEC,IZ+1,IX,IY)
+            IF ( (.NOT. G%NEEDSBCW(IZ,IX,IY)) .AND. IX .NE. 1     ) BX (IZ,IX,IY) = BX (IZ,IX,IY) + AW(IZ,IX,IY) * G%YJGN(IGSPEC,IZ,IX-1,IY)
+            IF ( (.NOT. G%NEEDSBCE(IZ,IX,IY)) .AND. IX .NE. NCELLX) BX (IZ,IX,IY) = BX (IZ,IX,IY) + AE(IZ,IX,IY) * G%YJGN(IGSPEC,IZ,IX+1,IY)
+         ENDDO
+         ENDDO
+      ENDIF
+
+      IF (SWEEPZ .AND. (.NOT. SWEEPX)) THEN
+         DO IX = 1, NCELLX
+         DO IZ = 1, NCELLZ
+            IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+            BZ (IZ,IX,IY) = 0D0; BX (IZ,IX,IY) = 0D0
+            IF ( (.NOT. G%NEEDSBCW(IZ,IX,IY)) .AND. IX .NE. 1     ) BX (IZ,IX,IY) = BX (IZ,IX,IY) + AW(IZ,IX,IY) * G%YJGN(IGSPEC,IZ,IX-1,IY)
+            IF ( (.NOT. G%NEEDSBCE(IZ,IX,IY)) .AND. IX .NE. NCELLX) BX (IZ,IX,IY) = BX (IZ,IX,IY) + AE(IZ,IX,IY) * G%YJGN(IGSPEC,IZ,IX+1,IY)
+         ENDDO
+         ENDDO
+      ENDIF
+
+      IF (SWEEPX .AND. (.NOT. SWEEPZ)) THEN
+         DO IX = 1, NCELLX
+         DO IZ = 1, NCELLZ
+            IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+            BZ (IZ,IX,IY) = 0D0; BX (IZ,IX,IY) = 0D0
+            IF ( (.NOT. G%NEEDSBCT(IZ,IX,IY)) .AND. IZ .NE. 1     ) BZ (IZ,IX,IY) = BZ (IZ,IX,IY) + AT(IZ,IX,IY) * G%YJGN(IGSPEC,IZ-1,IX,IY)
+            IF ( (.NOT. G%NEEDSBCB(IZ,IX,IY)) .AND. IZ .NE. NCELLZ) BZ (IZ,IX,IY) = BZ (IZ,IX,IY) + AB(IZ,IX,IY) * G%YJGN(IGSPEC,IZ+1,IX,IY)
+         ENDDO
+         ENDDO
+      ENDIF
+
+      BY(:,:,:) = 0.
+
+   ENDIF !End 2D diffusion terms
+
+   IF (NCELLZ .GT. 1 .AND. NCELLX .GT. 1 .AND. NCELLY .GT. 1) THEN !3D
+
+      IF (SWEEPX .AND. SWEEPY .AND. SWEEPZ) THEN
+         DO IY = 1, NCELLY
+         DO IX = 1, NCELLX
+         DO IZ = 1, NCELLZ
+            IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+            BZ (IZ,IX,IY) = 0D0; BX (IZ,IX,IY) = 0D0; ; BY (IZ,IX,IY) = 0D0
+            IF ( (.NOT. G%NEEDSBCT(IZ,IX,IY)) .AND. IZ .NE. 1     ) BZ (IZ,IX,IY) = BZ (IZ,IX,IY) + AT(IZ,IX,IY) * G%YJGN(IGSPEC,IZ-1,IX,IY)
+            IF ( (.NOT. G%NEEDSBCB(IZ,IX,IY)) .AND. IZ .NE. NCELLZ) BZ (IZ,IX,IY) = BZ (IZ,IX,IY) + AB(IZ,IX,IY) * G%YJGN(IGSPEC,IZ+1,IX,IY)
+            IF ( (.NOT. G%NEEDSBCW(IZ,IX,IY)) .AND. IX .NE. 1     ) BX (IZ,IX,IY) = BX (IZ,IX,IY) + AW(IZ,IX,IY) * G%YJGN(IGSPEC,IZ,IX-1,IY)
+            IF ( (.NOT. G%NEEDSBCE(IZ,IX,IY)) .AND. IX .NE. NCELLX) BX (IZ,IX,IY) = BX (IZ,IX,IY) + AE(IZ,IX,IY) * G%YJGN(IGSPEC,IZ,IX+1,IY)
+            IF ( (.NOT. G%NEEDSBCS(IZ,IX,IY)) .AND. IY .NE. 1     ) BY (IZ,IX,IY) = BY (IZ,IX,IY) + AS(IZ,IX,IY) * G%YJGN(IGSPEC,IZ,IX,IY-1)
+            IF ( (.NOT. G%NEEDSBCN(IZ,IX,IY)) .AND. IY .NE. NCELLY) BY (IZ,IX,IY) = BY (IZ,IX,IY) + AN(IZ,IX,IY) * G%YJGN(IGSPEC,IZ,IX,IY+1)
+         ENDDO
+         ENDDO
+         ENDDO
+      ENDIF
+
+      IF (SWEEPX .AND. (.NOT. SWEEPY)  .AND. (.NOT. SWEEPZ)) THEN
+         DO IY = 1, NCELLY
+         DO IX = 1, NCELLX
+         DO IZ = 1, NCELLZ
+            IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+            BZ (IZ,IX,IY) = 0D0; BX (IZ,IX,IY) = 0D0; ; BY (IZ,IX,IY) = 0D0
+            IF ( (.NOT. G%NEEDSBCT(IZ,IX,IY)) .AND. IZ .NE. 1     ) BZ (IZ,IX,IY) = BZ (IZ,IX,IY) + AT(IZ,IX,IY) * G%YJGN(IGSPEC,IZ-1,IX,IY)
+            IF ( (.NOT. G%NEEDSBCB(IZ,IX,IY)) .AND. IZ .NE. NCELLZ) BZ (IZ,IX,IY) = BZ (IZ,IX,IY) + AB(IZ,IX,IY) * G%YJGN(IGSPEC,IZ+1,IX,IY)
+            IF ( (.NOT. G%NEEDSBCS(IZ,IX,IY)) .AND. IY .NE. 1     ) BY (IZ,IX,IY) = BY (IZ,IX,IY) + AS(IZ,IX,IY) * G%YJGN(IGSPEC,IZ,IX,IY-1)
+            IF ( (.NOT. G%NEEDSBCN(IZ,IX,IY)) .AND. IY .NE. NCELLY) BY (IZ,IX,IY) = BY (IZ,IX,IY) + AN(IZ,IX,IY) * G%YJGN(IGSPEC,IZ,IX,IY+1)
+         ENDDO
+         ENDDO
+         ENDDO
+      ENDIF
+
+      IF ((.NOT. SWEEPX) .AND. SWEEPY .AND. (.NOT. SWEEPZ)) THEN
+         DO IY = 1, NCELLY
+         DO IX = 1, NCELLX
+         DO IZ = 1, NCELLZ
+            IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+            BZ (IZ,IX,IY) = 0D0; BX (IZ,IX,IY) = 0D0; ; BY (IZ,IX,IY) = 0D0
+            IF ( (.NOT. G%NEEDSBCT(IZ,IX,IY)) .AND. IZ .NE. 1     ) BZ (IZ,IX,IY) = BZ (IZ,IX,IY) + AT(IZ,IX,IY) * G%YJGN(IGSPEC,IZ-1,IX,IY)
+            IF ( (.NOT. G%NEEDSBCB(IZ,IX,IY)) .AND. IZ .NE. NCELLZ) BZ (IZ,IX,IY) = BZ (IZ,IX,IY) + AB(IZ,IX,IY) * G%YJGN(IGSPEC,IZ+1,IX,IY)
+            IF ( (.NOT. G%NEEDSBCW(IZ,IX,IY)) .AND. IX .NE. 1     ) BX (IZ,IX,IY) = BX (IZ,IX,IY) + AW(IZ,IX,IY) * G%YJGN(IGSPEC,IZ,IX-1,IY)
+            IF ( (.NOT. G%NEEDSBCE(IZ,IX,IY)) .AND. IX .NE. NCELLX) BX (IZ,IX,IY) = BX (IZ,IX,IY) + AE(IZ,IX,IY) * G%YJGN(IGSPEC,IZ,IX+1,IY)
+         ENDDO
+         ENDDO
+         ENDDO
+      ENDIF
+
+      IF ((.NOT. SWEEPX) .AND. (.NOT. SWEEPY) .AND. SWEEPZ) THEN
+         DO IY = 1, NCELLY
+         DO IX = 1, NCELLX
+         DO IZ = 1, NCELLZ
+            IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+            BZ (IZ,IX,IY) = 0D0; BX (IZ,IX,IY) = 0D0; ; BY (IZ,IX,IY) = 0D0
+            IF ( (.NOT. G%NEEDSBCW(IZ,IX,IY)) .AND. IX .NE. 1     ) BX (IZ,IX,IY) = BX (IZ,IX,IY) + AW(IZ,IX,IY) * G%YJGN(IGSPEC,IZ,IX-1,IY)
+            IF ( (.NOT. G%NEEDSBCE(IZ,IX,IY)) .AND. IX .NE. NCELLX) BX (IZ,IX,IY) = BX (IZ,IX,IY) + AE(IZ,IX,IY) * G%YJGN(IGSPEC,IZ,IX+1,IY)
+            IF ( (.NOT. G%NEEDSBCS(IZ,IX,IY)) .AND. IY .NE. 1     ) BY (IZ,IX,IY) = BY (IZ,IX,IY) + AS(IZ,IX,IY) * G%YJGN(IGSPEC,IZ,IX,IY-1)
+            IF ( (.NOT. G%NEEDSBCN(IZ,IX,IY)) .AND. IY .NE. NCELLY) BY (IZ,IX,IY) = BY (IZ,IX,IY) + AN(IZ,IX,IY) * G%YJGN(IGSPEC,IZ,IX,IY+1)
+         ENDDO
+         ENDDO
+         ENDDO
+      ENDIF
+
+   ENDIF !End 3D diffusion terms
+
+   CALL GET_CPU_TIME(TEND)
+   GPG%TUSED(23) = GPG%TUSED(23) + TEND - TSTART
+
+   CALL GET_CPU_TIME(TSTART)
+
+   IF (SWEEPX) THEN
+!$omp PARALLEL DO SCHEDULE(DYNAMIC,4) PRIVATE(IZ,IX,IY)
+      DO IZ = 1, NCELLZ
+      DO IY = 1, NCELLY
+         DO IX = 1, NCELLX
+            IF (G%IMASK(IZ,IX,IY) .NE. 0) THEN
+
+               APTOT(IZ,IX,IY) = 0D0
+               BTOT (IZ,IX,IY) = 0D0
+
+               DO I = 1, 4
+                  IF (I .EQ. 1) SOURCE = BZ           (       IZ,IX,IY)
+                  IF (I .EQ. 2) SOURCE = BY           (       IZ,IX,IY)
+                  IF (I .EQ. 3) SOURCE = BBC          (       IZ,IX,IY)
+                  IF (I .EQ. 4) SOURCE = GOMEGA3DXDYDZ(IGSPEC,IZ,IX,IY)
+
+                  IF (SOURCE .LT. 0D0) THEN
+                     APTOT(IZ,IX,IY) = APTOT(IZ,IX,IY) - SOURCE / MAX(G%YJGN(IGSPEC,IZ,IX,IY),EPS)
+                  ELSE
+                     BTOT(IZ,IX,IY) = BTOT(IZ,IX,IY) + SOURCE
+                  ENDIF
+               ENDDO
+
+               AP(IZ,IX,IY) = (AP1(IZ,IX,IY) + APTOT(IZ,IX,IY)) * RALPHA_YJG
+               B (IZ,IX,IY) = AP0YJG(IGSPEC,IZ,IX,IY) + BTOT(IZ,IX,IY) + AP(IZ,IX,IY)*YJGNOLD(IGSPEC,IZ,IX,IY) * OMALPHA_YJG
+            ELSE
+               B(IZ,IX,IY) = G%YJG(IGSPEC,IZ,IX,IY)
+            ENDIF
+         ENDDO
+         CALL TDMA_SOLVER_GENERAL(NCELLX,PTR(IZ,:,IY),AP(IZ,:,IY),AE(IZ,:,IY),AW(IZ,:,IY),B(IZ,:,IY))
+      ENDDO
+      ENDDO
+!$omp END PARALLEL DO
+   ENDIF 
+
+   IF (SWEEPY) THEN
+
+!$omp PARALLEL DO SCHEDULE(DYNAMIC,2) PRIVATE(IZ,IX,IY)
+      DO IZ = 1, NCELLZ
+      DO IX = 1, NCELLX
+         DO IY = 1, NCELLY
+            IF (G%IMASK(IZ,IX,IY) .NE. 0) THEN
+
+               APTOT(IZ,IX,IY) = 0D0
+               BTOT (IZ,IX,IY) = 0D0
+
+               DO I = 1, 4
+                  IF (I .EQ. 1) SOURCE = BZ           (       IZ,IX,IY)
+                  IF (I .EQ. 2) SOURCE = BX           (       IZ,IX,IY)
+                  IF (I .EQ. 3) SOURCE = BBC          (       IZ,IX,IY)
+                  IF (I .EQ. 4) SOURCE = GOMEGA3DXDYDZ(IGSPEC,IZ,IX,IY)
+
+                  IF (SOURCE .LT. 0D0) THEN
+                     APTOT(IZ,IX,IY) = APTOT(IZ,IX,IY) - SOURCE / MAX(G%YJGN(IGSPEC,IZ,IX,IY),EPS)
+                  ELSE
+                     BTOT(IZ,IX,IY) = BTOT(IZ,IX,IY) + SOURCE
+                  ENDIF
+               ENDDO
+
+               AP(IZ,IX,IY) = (AP1(IZ,IX,IY) + APTOT(IZ,IX,IY)) * RALPHA_YJG
+               B (IZ,IX,IY) = AP0YJG(IGSPEC,IZ,IX,IY) + BTOT(IZ,IX,IY) + AP(IZ,IX,IY)*YJGNOLD(IGSPEC,IZ,IX,IY) * OMALPHA_YJG
+            ELSE
+               B(IZ,IX,IY) = G%YJG(IGSPEC,IZ,IX,IY)
+            ENDIF
+         ENDDO
+         CALL TDMA_SOLVER_GENERAL(NCELLY,PTR(IZ,IX,:),AP(IZ,IX,:),AN(IZ,IX,:),AS(IZ,IX,:),B(IZ,IX,:))
+      ENDDO
+      ENDDO
+!$omp END PARALLEL DO
+   ENDIF
+
+   IF(SWEEPZ) THEN !SWEEPZ
+      DO IX = 1, NCELLX
+      DO IY = 1, NCELLY
+         DO IZ = 1, NCELLZ
+
+            IF (G%IMASK(IZ,IX,IY) .NE. 0) THEN
+
+               APTOT(IZ,IX,IY) = 0D0
+               BTOT (IZ,IX,IY) = 0D0
+
+               DO I = 1, 4
+                  IF (I .EQ. 1) SOURCE = BX           (       IZ,IX,IY)
+                  IF (I .EQ. 2) SOURCE = BY           (       IZ,IX,IY)
+                  IF (I .EQ. 3) SOURCE = BBC          (       IZ,IX,IY)
+                  IF (I .EQ. 4) SOURCE = GOMEGA3DXDYDZ(IGSPEC,IZ,IX,IY)
+
+                  IF (SOURCE .LT. 0D0) THEN
+                     APTOT(IZ,IX,IY) = APTOT(IZ,IX,IY) - SOURCE / MAX(G%YJGN(IGSPEC,IZ,IX,IY),EPS)
+                  ELSE
+                     BTOT(IZ,IX,IY) = BTOT(IZ,IX,IY) + SOURCE
+                  ENDIF
+               ENDDO
+                     
+               AP(IZ,IX,IY) = (AP1(IZ,IX,IY) + APTOT(IZ,IX,IY)) * RALPHA_YJG
+               B (IZ,IX,IY) = AP0YJG(IGSPEC,IZ,IX,IY) + BTOT(IZ,IX,IY) + AP(IZ,IX,IY)*YJGNOLD(IGSPEC,IZ,IX,IY) * OMALPHA_YJG
+            ELSE
+               B(IZ,IX,IY) = G%YJG(IGSPEC,IZ,IX,IY)
+            ENDIF
+         ENDDO
+         CALL TDMA_SOLVER_GENERAL(NCELLZ,PTR(:,IX,IY),AP(:,IX,IY),AB(:,IX,IY),AT(:,IX,IY),B(:,IX,IY))
+      ENDDO
+      ENDDO
+   ENDIF
+
+   CALL GET_CPU_TIME(TEND)
+   GPG%TUSED(27) = GPG%TUSED(27) + TEND - TSTART
+
+ENDDO !IGSPEC ENDDO
+
+CALL GET_CPU_TIME(TSTART)
+
+! Check convergence (relative tolerance)
+
+! This is how convergence was checked in 0.700:
+!EPS = 1D-5
+!YJGDIFF(:,:) = ABS(YJGN(:,:)-YJGNOLD(:,:)) 
+!WHERE(YJGNOLD(:,:) .LE. EPS) YJGDIFF(:,:) = YJGDIFF(:,:) / EPS
+!WHERE(YJGNOLD(:,:) .GT. EPS) YJGDIFF(:,:) = YJGDIFF(:,:) / YJGNOLD(:,:)
+!MAXDIFF = MAXVAL(YJGDIFF(:,:))
+
+IF (ITER .EQ. 1) THEN
+   CONVERGED_YJG(:,:,:,:) = .FALSE.
+   G%RESIDUAL_YJG(:,:,:,:) = 1.
+ELSE
+   CONVERGED_YJG(:,:,:,:) = .TRUE.
+!$omp PARALLEL DO SCHEDULE(DYNAMIC,4) PRIVATE(RESIDABS)
+   DO IY = 1, NCELLY
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+      YJSUM = 0D0
+      DO IGSPEC = 1, GPROP%NGSPEC
+         YJSUM = YJSUM + G%YJGN(IGSPEC,IZ,IX,IY)
+         
+         RESIDABS = REAL(G%IMASK(IZ,IX,IY))*ABS(G%YJGN(IGSPEC,IZ,IX,IY)-YJGNOLD(IGSPEC,IZ,IX,IY))
+         G%RESIDUAL_YJG(IGSPEC,IZ,IX,IY) =  RESIDABS / MAX(YJGNOLD(IGSPEC,IZ,IX,IY),GPG%EPS_YJG)
+         IF (G%YJGN(IGSPEC,IZ,IX,IY).NE.G%YJGN(IGSPEC,IZ,IX,IY) .OR. G%YJGN(IGSPEC,IZ,IX,IY).EQ.GPG%POSINF .OR. G%YJGN(IGSPEC,IZ,IX,IY).EQ.GPG%NEGINF) THEN
+            G%RESIDUAL_YJG(IGSPEC,IZ,IX,IY)=9D9
+            GPG%NAN = .TRUE.
+         ENDIF
+         IF (G%RESIDUAL_YJG(IGSPEC,IZ,IX,IY) .GT. GPG%YJTOL*ALPHA_YJG) THEN
+            CONVERGED_YJG(IGSPEC,IZ,IX,IY) = .FALSE.
+            CONVERGED_YJG(0     ,IZ,IX,IY) = .FALSE.
+         ENDIF
+      ENDDO
+
+      IF (YJSUM .LT. 0.999 .OR. YJSUM .GT. 1.001) THEN
+         G%RESIDUAL_YJG(:,IZ,IX,IY) = 10.
+         CONVERGED_YJG (:,IZ,IX,IY) = .FALSE.
+      ENDIF
+
+   ENDDO
+   ENDDO
+   ENDDO
+!$omp END PARALLEL DO
+ENDIF
+
+CALL GET_CPU_TIME(TEND)
+GPG%TUSED(7) = GPG%TUSED(7) + TEND - TSTART
+
+! *****************************************************************************
+END SUBROUTINE CONVECTIVE_DIFFUSIVE_SOLVER_NEW
+! *****************************************************************************
+
+
+! *****************************************************************************
+SUBROUTINE CALCULATE_GAS_DENSITY(IMESH,NCELLZ,NCELLX,NCELLY)
+! *****************************************************************************
+
+INTEGER, INTENT(IN) :: IMESH,NCELLZ,NCELLX,NCELLY
+INTEGER :: IZ,IX,IY,IGSPEC
+REAL(EB), POINTER, DIMENSION (:,:,:) :: MWN
+REAL(EB) :: TSTART, TEND
+
+CALL GET_CPU_TIME(TSTART)
+
+G=>GPM(IMESH)
+GPBCP(1:,1:,1:,-3:)=>G%GPYRO_BOUNDARY_CONDITION(1:,1:,1:,-3:)
+
+MWN => G%RWORK01
+
+! Calculate new gas density
+
+!$omp PARALLEL DO SCHEDULE(STATIC)
+DO IY = 1, NCELLY
+DO IX = 1, NCELLX
+DO IZ = 1, NCELLZ
+   MWN(IZ,IX,IY) = 0D0
+   DO IGSPEC = 1, GPROP%NGSPEC
+      MWN(IZ,IX,IY) = MWN(IZ,IX,IY) + G%YJGN(IGSPEC,IZ,IX,IY) / GPROP%M(IGSPEC)
+   ENDDO
+   MWN(IZ,IX,IY) = 1D0 / MWN(IZ,IX,IY)
+   IF (GPG%SOLVE_PRESSURE) THEN
+      G%RGN(IZ,IX,IY) = RHOGOFT(G%PN(IZ,IX,IY), MWN(IZ,IX,IY), G%TPN(IZ,IX,IY))
+   ELSE
+      G%RGN(IZ,IX,IY) = RHOGOFT(GPG%P0, MWN(IZ,IX,IY), G%TPN(IZ,IX,IY))
+   ENDIF
+ENDDO
+ENDDO
+ENDDO
+!$omp END PARALLEL DO
+
+CALL GET_CPU_TIME(TEND)
+GPG%TUSED(25) = GPG%TUSED(25) + TEND - TSTART 
+
+! *****************************************************************************
+END SUBROUTINE CALCULATE_GAS_DENSITY
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE REACTION_RATE_T(IMESH,NCELLZ,NCELLX,NCELLY)
+! *****************************************************************************
+
+INTEGER, INTENT(IN) :: IMESH,NCELLZ,NCELLX,NCELLY
+
+REAL(EB), PARAMETER  :: R0 = 8.314E-3
+INTEGER :: IZ,IX,IY,IRXN
+REAL(EB) :: TSTART,TEND,MULT
+REAL(EB), POINTER, DIMENSION(:,:,:) :: TRXN
+
+CALL GET_CPU_TIME(TSTART)
+
+G=>GPM(IMESH)
+GPBCP(1:,1:,1:,-3:)=>G%GPYRO_BOUNDARY_CONDITION(1:,1:,1:,-3:)
+
+TRXN => G%RWORK01
+
+! TRXN could be set to TP if there's convergence problems, but it should
+! really be TPN
+IF (GPG%EXPLICIT_T) THEN
+   TRXN(:,:,:) = G%TP (:,:,:)
+ELSE
+   TRXN(:,:,:) = G%TPN(:,:,:)
+ENDIF
+
+! Calculate temperature part of forward reaction rate (destruction)
+! RRT=Z*exp(-TA/T) * RYIDZSIGMA / DLTZ plus O2 dependency, if any
+
+!$omp PARALLEL DO SCHEDULE(STATIC) PRIVATE(MULT)
+DO IY = 1, NCELLY
+DO IX = 1, NCELLX
+DO IZ = 1, NCELLZ
+DO IRXN = 1, SPROP%NRXN
+   G%RRT(IRXN,IZ,IX,IY) = 0D0 
+   IF (G%IMASK  (IZ,IX,IY) .EQ. 0) CYCLE
+   IF (G%CONSUMED(IZ,IX,IY)) CYCLE
+   IF (TRXN(IZ,IX,IY) .GE. RXN(IRXN)%TCRIT) THEN
+      MULT = MIN( TRXN(IZ,IX,IY)-RXN(IRXN)%TCRIT, 1D0)
+      G%RRT(IRXN,IZ,IX,IY) = MULT*RXN(IRXN)%Z*EXP(-RXN(IRXN)%E/(R0*TRXN(IZ,IX,IY))) * G%RYIDZSIGMA(RXN(IRXN)%IFROM,IZ,IX,IY)/G%DLTZN(IZ,IX,IY)
+   ENDIF
+   IF (RXN(IRXN)%ORDERO2 .NE. 0D0) THEN
+      IF (GPG%SOLVE_GAS_YJ .OR. NCELLZ .EQ. 1) THEN !TGA
+         IF (RXN(IRXN)%IO2TYPE .EQ. 0) THEN ! [(1+YO2)^nO2-1]
+            MULT=(1D0+G%YJGN(GPROP%IO2,IZ,IX,IY))**RXN(IRXN)%ORDERO2-1D0
+!            MULT=(1D0+G%YJG(GPROP%IO2,IZ,IX,IY))**RXN(IRXN)%ORDERO2-1D0
+         ELSE !YO2^nO2
+            MULT=G%YJGN(GPROP%IO2,IZ,IX,IY)**RXN(IRXN)%ORDERO2
+         ENDIF
+      ENDIF
+      G%RRT(IRXN,IZ,IX,IY) = G%RRT(IRXN,IZ,IX,IY) * MULT
+   ENDIF
+ENDDO
+ENDDO
+ENDDO
+ENDDO
+!$omp END PARALLEL DO
+
+CALL GET_CPU_TIME(TEND)
+GPG%TUSED(16) = GPG%TUSED(16) + TEND - TSTART
+
+! *****************************************************************************      
+END SUBROUTINE REACTION_RATE_T
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE REACTION_RATE_Y(IMESH,NCELLZ,NCELLX,NCELLY)
+! *****************************************************************************
+
+INTEGER, INTENT(IN) :: IMESH,NCELLZ,NCELLX,NCELLY
+INTEGER :: IRXN,IKM,IZ,IX,IY,ISPEC
+LOGICAL :: CALCOMALPHA, CALCALPHA
+REAL(EB) :: TSTART,TEND,M,N,OMN
+REAL(EB), POINTER, DIMENSION(:,:,:) :: ALPHA, OMALPHA
+
+CALL GET_CPU_TIME(TSTART)
+
+G=>GPM(IMESH)
+
+ALPHA=>G%RWORK01
+OMALPHA=>G%RWORK02
+
+GPBCP(1:,1:,1:,-3:)=>G%GPYRO_BOUNDARY_CONDITION(1:,1:,1:,-3:)
+G%RRY(:,:,:,:) = 0D0 
+
+! Determine unreactedness, i.e. 1 - conversion
+
+!$omp PARALLEL DO SCHEDULE(STATIC)
+DO IY = 1, NCELLY
+DO IX = 1, NCELLX
+DO IZ = 1, NCELLZ
+DO ISPEC = 1, SPROP%NSSPEC
+   IF (G%RYIDZSIGMAN  (ISPEC,IZ,IX,IY) .GT. 0D0) THEN
+      G%UNREACTEDNESS(ISPEC,IZ,IX,IY) = G%RYIDZPN(ISPEC,IZ,IX,IY) / G%RYIDZSIGMAN(ISPEC,IZ,IX,IY)
+   ELSEIF (G%UNREACTEDNESS(ISPEC,IZ,IX,IY) .LT. 0D0) THEN
+      G%UNREACTEDNESS(ISPEC,IZ,IX,IY) = 0D0
+   ELSE
+      G%UNREACTEDNESS(ISPEC,IZ,IX,IY) = 1D0
+   ENDIF
+ENDDO
+ENDDO
+ENDDO
+ENDDO
+!$omp END PARALLEL DO
+   
+! Calculate Y part of reaction rate
+
+!$omp PARALLEL DO SCHEDULE(STATIC) PRIVATE(M, N, OMN, IKM, CALCOMALPHA, CALCALPHA) 
+DO IY = 1, NCELLY
+DO IX = 1, NCELLX
+DO IZ = 1, NCELLZ
+DO IRXN = 1, SPROP%NRXN
+   M       = RXN(IRXN)%M       ! m 
+   N       = RXN(IRXN)%ORDER   ! n 
+   OMN     = 1D0 - N           ! 1 - n
+   IKM = RXN(IRXN)%IKINETICMODEL
+   CALCOMALPHA = .FALSE.; IF (IKM .EQ. 0 .OR. IKM .EQ. 1 .OR. IKM .EQ. 2 .OR. IKM .EQ. 4 .OR. IKM .EQ. 5 .OR. IKM .EQ. 6 .OR. IKM .EQ. 8 .OR. IKM .EQ. 9) CALCOMALPHA=.TRUE.
+   CALCALPHA   = .FALSE.;       IF (IKM .EQ. 3 .OR. IKM .EQ. 6 .OR. IKM .EQ. 7 .OR. M .NE. 0D0) CALCALPHA = .TRUE.       
+   IF (CALCOMALPHA) OMALPHA(IZ,IX,IY) =       G%UNREACTEDNESS(RXN(IRXN)%IFROM,IZ,IX,IY) ! 1 - alpha
+   IF (CALCALPHA  ) ALPHA  (IZ,IX,IY) = 1D0 - G%UNREACTEDNESS(RXN(IRXN)%IFROM,IZ,IX,IY) ! alpha
+
+   SELECT CASE (RXN(IRXN)%IKINETICMODEL)
+      CASE(0) !Default reaction order treatment
+         IF (N .GT. 0.99999 .AND. N .LT. 1.00001) THEN
+            IF (.NOT. G%CONSUMED(IZ,IX,IY) .AND. G%IMASK(IZ,IX,IY) .NE. 0) G%RRY(IRXN,IZ,IX,IY)= OMALPHA(IZ,IX,IY) 
+         ELSE
+            IF (.NOT. G%CONSUMED(IZ,IX,IY) .AND. G%IMASK(IZ,IX,IY) .NE. 0) G%RRY(IRXN,IZ,IX,IY)= OMALPHA(IZ,IX,IY) ** N 
+         ENDIF
+      CASE(1) !Nucleation and nucleus growing
+         IF (.NOT. G%CONSUMED(IZ,IX,IY) .AND. G%IMASK(IZ,IX,IY) .NE. 0) G%RRY(IRXN,IZ,IX,IY)= (1D0/N) * OMALPHA(IZ,IX,IY) * (-LOG(MIN(OMALPHA(IZ,IX,IY),1D0-1D-12)))**OMN
+      CASE(2) !Phase boundary - same as CASE(0)
+         IF (N .GT. 0.99999 .AND. N .LT. 1.00001) THEN
+            IF (.NOT. G%CONSUMED(IZ,IX,IY) .AND. G%IMASK(IZ,IX,IY) .NE. 0) G%RRY(IRXN,IZ,IX,IY)= OMALPHA(IZ,IX,IY) 
+         ELSE
+            IF (.NOT. G%CONSUMED(IZ,IX,IY) .AND. G%IMASK(IZ,IX,IY) .NE. 0) G%RRY(IRXN,IZ,IX,IY)= OMALPHA(IZ,IX,IY) ** N 
+         ENDIF
+      CASE(3) !Diffusion - plane symmetry
+         IF (.NOT. G%CONSUMED(IZ,IX,IY) .AND. G%IMASK(IZ,IX,IY) .NE. 0) G%RRY(IRXN,IZ,IX,IY)= 0.5D0 / MAX(ALPHA(IZ,IX,IY), 1D-12)
+      CASE(4) !Diffusion - cylindrical symmetry
+         IF (.NOT. G%CONSUMED(IZ,IX,IY) .AND. G%IMASK(IZ,IX,IY) .NE. 0) G%RRY(IRXN,IZ,IX,IY)= -1D0 / LOG(MIN(OMALPHA(IZ,IX,IY),1D0-1D-12))
+      CASE(5) !Diffusion - spherical symmetry
+         IF (.NOT. G%CONSUMED(IZ,IX,IY) .AND. G%IMASK(IZ,IX,IY) .NE. 0) G%RRY(IRXN,IZ,IX,IY)= 1.5D0/MAX(OMALPHA(IZ,IX,IY)**(-1D0/3D0)-1D0,1D-12)
+      CASE(6) !Diffusion - Jander
+         IF (.NOT. G%CONSUMED(IZ,IX,IY) .AND. G%IMASK(IZ,IX,IY) .NE. 0) G%RRY(IRXN,IZ,IX,IY)= 1.5D0 * MIN(OMALPHA(IZ,IX,IY),1D0-1D-12)**(-1D0/3D0) / MAX(ALPHA(IZ,IX,IY),1D-12)
+      CASE(7) !Potential law
+         IF (.NOT. G%CONSUMED(IZ,IX,IY) .AND. G%IMASK(IZ,IX,IY) .NE. 0) G%RRY(IRXN,IZ,IX,IY)= (1D0/N) * MAX(ALPHA(IZ,IX,IY),1D-12) ** OMN 
+      CASE(8) !Reaction order
+         IF (.NOT. G%CONSUMED(IZ,IX,IY) .AND. G%IMASK(IZ,IX,IY) .NE. 0) G%RRY(IRXN,IZ,IX,IY)= (1D0/N) * OMALPHA(IZ,IX,IY) ** OMN
+      CASE(9) !Catalytic
+         IF(.NOT. G%CONSUMED(IZ,IX,IY) .AND. G%IMASK(IZ,IX,IY) .NE. 0) G%RRY(IRXN,IZ,IX,IY)= (OMALPHA(IZ,IX,IY) ** N) *  (1D0 + RXN(IRXN)%KCAT * (1D0 - G%UNREACTEDNESS(RXN(IRXN)%ICAT,IZ,IX,IY))) 
+      CASE DEFAULT 
+         CONTINUE 
+   END SELECT
+
+   IF (.NOT. (M .GT. -0.00001 .AND. M .LT. 0.00001)) THEN
+      ALPHA(IZ,IX,IY) = MAX(1D-10,ALPHA(IZ,IX,IY))
+      G%RRY(IRXN,IZ,IX,IY) = G%RRY(IRXN,IZ,IX,IY) * ALPHA(IZ,IX,IY) ** M 
+   ENDIF
+
+ENDDO
+ENDDO
+ENDDO
+ENDDO
+!$omp END PARALLEL DO
+
+CALL GET_CPU_TIME(TEND)
+GPG%TUSED(17) = GPG%TUSED(17) + TEND - TSTART
+
+! *****************************************************************************
+END SUBROUTINE REACTION_RATE_Y
+! *****************************************************************************
+
+! *****************************************************************************      
+SUBROUTINE SPECIES_SOURCE_TERMS(IMESH,NCELLZ,NCELLX,NCELLY,YISCONVERGED,YJGCONVERGED,ITER)
+! *****************************************************************************
+INTEGER, INTENT(IN) :: IMESH,NCELLZ,NCELLX,NCELLY,ITER
+LOGICAL, INTENT(IN) :: YISCONVERGED, YJGCONVERGED
+INTEGER :: IGSPEC,IZ,IX,IY,IRXN,ISPEC,IA,IB
+REAL(EB) :: TSTART,TEND,P,Q,B,Z,TA
+INTEGER, DIMENSION(1:20), SAVE :: IFROM,ITOS
+REAL(EB), DIMENSION(1:NCELLZ) :: CA,CB
+REAL(EB), POINTER, DIMENSION(:,:,:) :: TRXN
+REAL(EB), POINTER, DIMENSION(:,:,:,:) :: RHOFROM, RHOTO
+
+CALL GET_CPU_TIME(TSTART)
+
+G=>GPM(IMESH)
+
+TRXN    => G%RWORK01
+RHOFROM => G%RWORK120
+RHOTO   => G%RWORK121
+
+IF ( (.NOT. YISCONVERGED) .OR. (GPG%SOLVE_GAS_YJ .AND. (.NOT. YJGCONVERGED))) THEN
+
+   G%SOMEGA  (:,:,:,:,:) = 0D0
+   G%GOMEGA  (:,:,:,:,:) = 0D0
+   G%OMEGASFG(:,:,:)     = 0D0
+
+   ! TRXN could be set to TP if there's convergence problems, but it should really be TPN
+   IF (GPG%EXPLICIT_T) THEN
+      TRXN(:,:,:) = G%TP (:,:,:)
+   ELSE
+      TRXN(:,:,:) = G%TPN(:,:,:)
+   ENDIF
+
+   IF (ITER .EQ. 1) THEN
+      DO IRXN = 1, SPROP%NRXN
+         IFROM(IRXN) = RXN(IRXN)%IFROM
+         ITOS (IRXN) = RXN(IRXN)%ITOS
+         DO IY = 1, NCELLY
+         DO IX = 1, NCELLX
+         DO IZ = 1, NCELLZ
+            IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+            RHOFROM(IRXN,IZ,IX,IY) = RHOOFT(IFROM(IRXN),TRXN(IZ,IX,IY))
+            IF (ITOS(IRXN) .GT. 0) THEN
+               RHOTO  (IRXN,IZ,IX,IY) = RHOOFT(ITOS (IRXN),TRXN(IZ,IX,IY))
+            ELSE
+               RHOTO  (IRXN,IZ,IX,IY) = 0. 
+            ENDIF
+         ENDDO
+	     ENDDO
+         ENDDO
+         G%OMSOLIDFRAC(IRXN,:,:,:) = -RXN(IRXN)%CHI * (RHOTO(IRXN,:,:,:)/RHOFROM(IRXN,:,:,:) - 1D0)
+      ENDDO !IRXN
+   ENDIF !ITER .EQ. 1
+
+   ! First, determine the quantities SOLIDFRAC (solid fraction) and 
+   ! OMSOLIDFRAC (one minus solid fraction). Note that to save time,
+   ! this could be pre-calculated and stored as a function of temperature
+   ! for each reaction. 
+
+!!$omp PARALLEL DO SCHEDULE(STATIC) !Enabling this causes problems. 
+   DO IRXN = 1, SPROP%NRXN
+      DO IY = 1, NCELLY
+      DO IX = 1, NCELLX
+      DO IZ = 1, NCELLZ
+         IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+         G%OMEGASDAK  (IRXN,IZ,IX,IY) = G%RRY(IRXN,IZ,IX,IY) * G%RRT(IRXN,IZ,IX,IY)
+         G%OMEGASFBK  (IRXN,IZ,IX,IY) = (1D0-G%OMSOLIDFRAC(IRXN,IZ,IX,IY))*G%OMEGASDAK(IRXN,IZ,IX,IY)
+         G%OMEGASFGK  (IRXN,IZ,IX,IY) = G%OMSOLIDFRAC(IRXN,IZ,IX,IY)*G%OMEGASDAK(IRXN,IZ,IX,IY)
+         G%OMEGASFG   (     IZ,IX,IY) = G%OMEGASFG(IZ,IX,IY) + G%OMEGASFGK(IRXN,IZ,IX,IY)
+      ENDDO
+      ENDDO
+      ENDDO
+
+      DO IGSPEC = 1, GPROP%NGSPEC
+         IF (GPROP%YIELDS(IGSPEC,IRXN) .GT. -1D-6 .AND. GPROP%YIELDS(IGSPEC,IRXN) .LT. 1D-6) CYCLE
+         IF (GPROP%YIELDS(IGSPEC,IRXN) .GT. 0D0) THEN !Formation of gaseous species
+            DO IY = 1, NCELLY
+            DO IX = 1, NCELLX
+            DO IZ = 1, NCELLZ
+               IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+               G%OMEGASFJK(IGSPEC,IRXN,IZ,IX,IY) = G%OMEGASFGK(IRXN,IZ,IX,IY) * GPROP%YIELDS(IGSPEC,IRXN)
+               G%GOMEGA(1,IGSPEC,IZ,IX,IY) = G%GOMEGA(1,IGSPEC,IZ,IX,IY) + G%OMEGASFJK(IGSPEC,IRXN,IZ,IX,IY)
+            ENDDO
+            ENDDO
+            ENDDO
+         ELSE !Destruction of gaseous species
+            DO IY = 1, NCELLY
+            DO IX = 1, NCELLX
+            DO IZ = 1, NCELLZ
+               IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+               G%OMEGASDJK(IGSPEC,IRXN,IZ,IX,IY) =-G%OMEGASFGK(IRXN,IZ,IX,IY) * GPROP%YIELDS(IGSPEC,IRXN)
+               G%GOMEGA(2,IGSPEC,IZ,IX,IY) = G%GOMEGA(2,IGSPEC,IZ,IX,IY) + G%OMEGASDJK(IGSPEC,IRXN,IZ,IX,IY)
+            ENDDO
+            ENDDO
+            ENDDO
+         ENDIF
+      ENDDO !IGSPEC
+
+      DO IY = 1, NCELLY
+      DO IX = 1, NCELLX
+      DO IZ = 1, NCELLZ
+         IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+         IF (ITOS(IRXN) .NE. 0) G%SOMEGA(1,ITOS(IRXN),IZ,IX,IY) = G%SOMEGA(1,ITOS(IRXN),IZ,IX,IY) + G%OMEGASFBK(IRXN,IZ,IX,IY)
+         G%SOMEGA(2,IFROM(IRXN),IZ,IX,IY) = G%SOMEGA(2,IFROM(IRXN),IZ,IX,IY) + G%OMEGASDAK(IRXN,IZ,IX,IY)
+      ENDDO
+      ENDDO
+      ENDDO
+
+   ENDDO !IRXN
+!!$omp END PARALLEL DO
+
+   DO IY = 1, NCELLY
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+      IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+      DO IGSPEC = 1, GPROP%NGSPEC
+         G%GOMEGA(3,IGSPEC,IZ,IX,IY) = G%GOMEGA(1,IGSPEC,IZ,IX,IY) - G%GOMEGA(2,IGSPEC,IZ,IX,IY)
+         G%GOMEGA(3,0,IZ,IX,IY) = G%GOMEGA(3,0,IZ,IX,IY) + G%GOMEGA(3,IGSPEC,IZ,IX,IY)
+      ENDDO
+      DO ISPEC = 1, SPROP%NSSPEC
+         G%SOMEGA(3,ISPEC,IZ,IX,IY) = G%SOMEGA(1,ISPEC,IZ,IX,IY) - G%SOMEGA(2,ISPEC,IZ,IX,IY)
+      ENDDO
+   ENDDO
+   ENDDO
+   ENDDO
+
+ENDIF !.NOT. YISCONVERGED
+
+IF (.NOT. YJGCONVERGED .AND. GPROP%NHGRXN .GT. 0) THEN
+
+   DO IY = 1, NCELLY
+   DO IX = 1, NCELLX
+
+   ! Calculate homogeneous gas reaction rates
+   ! 1 = FORMATION
+   ! 2 = DESTRUCTION
+   ! 3 = NET
+      G%HGOMEGA(:,:,:,IX,IY) = 0D0
+      DO IRXN = 1, GPROP%NHGRXN
+         IA = HGRXN(IRXN)%IREACTANT1
+         IB = HGRXN(IRXN)%IREACTANT2
+         P  = HGRXN(IRXN)%P
+         Q  = HGRXN(IRXN)%Q
+         B  = HGRXN(IRXN)%B
+         Z  = HGRXN(IRXN)%Z
+         TA = 1D3*HGRXN(IRXN)%E / 8.314D0
+
+         CA(:) = 1D3 * G%RGN(:,IX,IY) * G%YJGN(IA,:,IX,IY) / GPROP%M(IA)
+         CB(:) = 1D3 * G%RGN(:,IX,IY) * G%YJGN(IB,:,IX,IY) / GPROP%M(IB)
+            
+! Try to limit exponentiation where possible (cpu time):            
+         IF (P .EQ. 1D0) THEN
+            G%HGRR(IRXN,:,IX,IY) = CA(:)
+         ELSE
+            G%HGRR(IRXN,:,IX,IY)=CA(:)**P
+         ENDIF
+            
+         IF (Q .EQ. 1D0) THEN
+            G%HGRR(IRXN,:,IX,IY) = G%HGRR(IRXN,:,IX,IY) * CB(:)
+         ELSE
+            G%HGRR(IRXN,:,IX,IY) = G%HGRR(IRXN,:,IX,IY) * CB(:)**Q
+         ENDIF
+            
+         IF (B .EQ. 0D0) THEN
+            CONTINUE
+         ELSE
+            IF (GPG%THERMAL_EQUILIBRIUM) THEN
+               G%HGRR(IRXN,:,IX,IY) = G%HGRR(IRXN,:,IX,IY) * G%TP(:,IX,IY)**B
+            ELSE
+               G%HGRR(IRXN,:,IX,IY) = G%HGRR(IRXN,:,IX,IY) * G%TG(:,IX,IY)**B
+            ENDIF
+         ENDIF
+            
+         IF (GPG%THERMAL_EQUILIBRIUM) THEN
+            G%HGRR(IRXN,:,IX,IY) = G%HGRR(IRXN,:,IX,IY) * Z * EXP(-TA/G%TP(:,IX,IY))
+         ELSE
+            G%HGRR(IRXN,:,IX,IY) = G%HGRR(IRXN,:,IX,IY) * Z * EXP(-TA/G%TG(:,IX,IY))
+         ENDIF
+            
+         G%HGRR(IRXN,:,IX,IY) = G%HGRR(IRXN,:,IX,IY) * G%POROSS(:,IX,IY)
+                          
+         DO IGSPEC = 1, GPROP%NGSPEC
+            IF (GPROP%HGYIELDS(IGSPEC,IRXN) .EQ. 0D0) CYCLE
+            IF (GPROP%HGYIELDS(IGSPEC,IRXN) .GT. 0D0) THEN !Formation
+               G%HGOMEGA(1,IGSPEC,:,IX,IY) = G%HGOMEGA(1,IGSPEC,:,IX,IY) + & 
+                  G%HGRR(IRXN,:,IX,IY)*GPROP%HGYIELDS(IGSPEC,IRXN)
+            ELSE !Destruction
+               G%OMEGAGDJL(IGSPEC,IRXN,:,IX,IY) = -G%HGRR(IRXN,:,IX,IY)*GPROP%HGYIELDS(IGSPEC,IRXN)
+               G%HGOMEGA(2,IGSPEC,:,IX,IY) = G%HGOMEGA(2,IGSPEC,:,IX,IY) + & 
+                  G%OMEGAGDJL(IGSPEC,IRXN,:,IX,IY)
+            ENDIF
+         ENDDO !IGSPEC = 1, GPROP%NGSPEC
+                  
+      ENDDO !IRXN = 1, GPROP%NHGRXN
+
+! Net rate:      
+   G%HGOMEGA(3,:,:,IX,IY) = G%HGOMEGA(1,:,:,IX,IY) - G%HGOMEGA(2,:,:,IX,IY)
+   
+   ENDDO
+   ENDDO
+
+ENDIF !YJGCONVERGED
+
+CALL GET_CPU_TIME(TEND)
+GPG%TUSED(8) = GPG%TUSED(8) + TEND - TSTART
+
+! *****************************************************************************
+END SUBROUTINE SPECIES_SOURCE_TERMS
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE ENERGY_SOURCE_TERMS(IMESH,NCELLZ,NCELLX,NCELLY,DTIME)
+! *****************************************************************************
+
+INTEGER, INTENT(IN) :: IMESH,NCELLZ,NCELLX,NCELLY
+REAL(EB), INTENT(IN) :: DTIME
+INTEGER :: ISPEC,IGSPEC,IZ,IX,IY,IRXN,IOR
+REAL(EB) :: TSTART,TEND,MDOTBACK(1:NCELLX,1:NCELLY)
+REAL(EB), POINTER, DIMENSION(:,:,:) :: MDOTPPT, FLUX
+
+CALL GET_CPU_TIME(TSTART)
+
+! Calculate positive and negative components of source term
+! for solid enthalpy equation:
+
+G => GPM(IMESH)
+GPBCP(1:,1:,1:,-3:)=>G%GPYRO_BOUNDARY_CONDITION(1:,1:,1:,-3:)
+
+MDOTPPT=>G%RWORK01
+FLUX   =>G%RWORK02
+
+G%SHM= 0D0
+G%SHP= 0D0
+
+! Gas/solid heat transfer:      
+IF (GPG%SOLVE_GAS_ENERGY .AND. (.NOT. GPG%THERMAL_EQUILIBRIUM)) THEN
+   IF (GPG%HCV .LT. 0D0) THEN
+      G%SHP(:,:,:) = G%HCV(:,:,:)*G%TGN(:,:,:)
+      G%SHM(:,:,:) = G%HCV(:,:,:)*G%TPN(:,:,:)         
+   ELSE
+      G%SHP(:,:,:) = GPG%HCV*G%TGN(:,:,:)
+      G%SHM(:,:,:) = GPG%HCV*G%TPN(:,:,:)
+   ENDIF
+ELSE
+   IF (GPG%THERMAL_EQUILIBRIUM ) THEN
+ 
+      IF (G%NCELLY .EQ. 1 .AND. G%NCELLX .EQ. 1) THEN
+
+         IF (GPG%SOLVE_PRESSURE) THEN !Mass flux calcd at cell 'top':
+            MDOTPPT(:,:,:) =  G%MDOTPPDARCYT(:,:,:)
+         ELSE
+            MDOTPPT(:,:,:) = -G%MDOTPPZ(0,:,:,:)
+         ENDIF
+      
+         IF (GPG%FULL_QSG) THEN !Detailed way of calculating QSG
+            G%QSG(:,:,:) = G%RG(:,:,:) * G%POROSS(:,:,:) * GPROP%CPG * (G%TPN(:,:,:) - G%TP(:,:,:)) / DTIME
+
+            DO IZ = NCELLZ-1, 1, -1
+               G%QSG(IZ,:,:)= G%QSG(IZ,:,:) + MDOTPPT(IZ+1,:,:) * GPROP%CPG * (G%TPN(IZ+1,:,:)-G%TPN(IZ,:,:)) / G%DZT(IZ,:,:)
+            ENDDO
+         
+            FLUX(NCELLZ,:,:) = 0D0 !Defined at bottom of cell. This should be done more precisely, FIX!!!
+            DO IZ = 1, NCELLZ-1
+               FLUX(IZ,:,:) = G%PSIRGDB(IZ,:,:) * GPROP%CPG * (G%TPN(IZ+1,:,:)-G%TPN(IZ,:,:)) / G%DZT(IZ,:,:) 
+            ENDDO
+
+            DO IZ = 1, NCELLZ-1
+               G%QSG(IZ,:,:) = G%QSG(IZ,:,:) - (FLUX(IZ+1,:,:) - FLUX (IZ,:,:)) / G%DZT(IZ,:,:)
+            ENDDO
+                  
+         ELSE !Default way of calculating QSG
+
+            G%QSG(:,:,:)= 0D0
+            DO IZ = NCELLZ-1, 1, -1
+                G%QSG(IZ,:,:)= MDOTPPT(IZ+1,:,:) * GPROP%CPG * (G%TPN(IZ+1,:,:)-G%TPN(IZ,:,:)) / G%DZT(IZ,:,:)
+            ENDDO
+
+         ENDIF
+      ENDIF
+
+! If thermal equilibrium, add heat release from homogeneous
+! gas-phase reactions to condensed-phase
+      IF (GPG%SOLVE_GAS_ENERGY .AND. GPROP%NHGRXN .GT. 0) THEN 
+         DO IRXN = 1, GPROP%NHGRXN
+            G%QSG(:,:,:) = G%QSG(:,:,:) + G%HGRR(IRXN,:,:,:) * HGRXN(IRXN)%DH 
+         ENDDO         
+      ENDIF    
+
+! If gases coming in back face are not in thermal equilibrium with 
+! solid-phase, then QSG must be accounted for:
+      IF (G%NCELLY .EQ. 1 .AND. G%NCELLX .EQ. 1) THEN
+         IOR=-3
+         MDOTBACK(:,:) = 0D0
+         WHERE(GPBCP(NCELLZ,:,:,IOR)%PRES .LT. 0D0) MDOTBACK(:,:) = -1D-3 * GPBCP(NCELLZ,:,:,IOR)%MFLUX
+               
+         G%QSG(NCELLZ,:,:) = MDOTBACK(:,:) * GPROP%CPG *(GPBCP(NCELLZ,:,:,IOR)%TINF - G%TPN(NCELLZ,:,:) ) / G%DLTZN(NCELLZ,:,:)
+         WHERE    (G%QSG(:,:,:) .GT. 0D0)
+            G%SHM(:,:,:) = G%SHM(:,:,:) + G%QSG(:,:,:)
+         ELSEWHERE(G%QSG(:,:,:) .LT. 0D0)
+            G%SHP(:,:,:) = G%SHP(:,:,:) - G%QSG(:,:,:)
+         ENDWHERE
+      ENDIF
+      
+   ELSE !THERMAL_EQUILIBRIUM
+      G%QSG(:,:,:) = 0D0
+   ENDIF
+ENDIF
+
+! This term shows up when the gas-phase mass conservation equation
+! is multiplied by HPN and then subtracted from the energy
+! conservation equation            
+
+!G%SHP(:,:,:) = G%SHP(:,:,:) + G%OMEGASFG(:,:,:) * G%HPN(:,:,:)
+
+! Get enthalpy of each species and then do 
+! formation and destruction of solid-phase species due to reactions
+!$omp PARALLEL DO SCHEDULE(DYNAMIC,4) PRIVATE(IZ,IX,IY,ISPEC,IRXN)
+DO IY = 1, NCELLY
+DO IX = 1, NCELLX
+DO IZ = 1, NCELLZ
+   IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+   G%SHP(IZ,IX,IY) = G%SHP(IZ,IX,IY) + G%OMEGASFG(IZ,IX,IY) * G%HPN(IZ,IX,IY)
+   DO ISPEC = 1, SPROP%NSSPEC 
+      G%HI(ISPEC,IZ,IX,IY) = HOFT(ISPEC,G%TPN(IZ,IX,IY) )
+      G%SHP(IZ,IX,IY) = G%SHP(IZ,IX,IY) + G%SOMEGA(1,ISPEC,IZ,IX,IY) * G%HI(ISPEC,IZ,IX,IY)
+      G%SHM(IZ,IX,IY) = G%SHM(IZ,IX,IY) + G%SOMEGA(2,ISPEC,IZ,IX,IY) * G%HI(ISPEC,IZ,IX,IY)
+   ENDDO
+ENDDO
+ENDDO
+ENDDO
+!$omp END PARALLEL DO
+
+DO IRXN = 1, SPROP%NRXN
+   IF (RXN(IRXN)%DHS .GT. -1D-6 .AND. RXN(IRXN)%DHS .LT. 1D-6) CYCLE
+   DO IY = 1, NCELLY
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+      IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+
+      IF (RXN(IRXN)%DHS .LE. 0D0) THEN
+         G%SHP(IZ,IX,IY) = G%SHP(IZ,IX,IY) - G%OMEGASFBK(IRXN,IZ,IX,IY) * RXN(IRXN)%DHS
+      ELSE
+         G%SHM(IZ,IX,IY) = G%SHM(IZ,IX,IY) + G%OMEGASFBK(IRXN,IZ,IX,IY) * RXN(IRXN)%DHS
+      ENDIF
+   ENDDO
+   ENDDO
+   ENDDO
+ENDDO
+
+DO IRXN = 1, SPROP%NRXN
+   IF (RXN(IRXN)%DHV .GT. -1D-6 .AND. RXN(IRXN)%DHV .LT. 1D-6) CYCLE
+   DO IY = 1, NCELLY
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+      IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+
+      IF (RXN(IRXN)%DHV .LE. 0D0) THEN
+         G%SHP(IZ,IX,IY) = G%SHP(IZ,IX,IY) - G%OMEGASFGK(IRXN,IZ,IX,IY) * RXN(IRXN)%DHV
+      ELSE
+         G%SHM(IZ,IX,IY) = G%SHM(IZ,IX,IY) + G%OMEGASFGK(IRXN,IZ,IX,IY) * RXN(IRXN)%DHV
+      ENDIF
+   ENDDO
+   ENDDO
+   ENDDO
+ENDDO
+
+! Gas-phase heat of reaction:
+IF (.NOT. GPG%CONSTANT_DHVOL) THEN
+   DO IRXN = 1, SPROP%NRXN   
+      IF (GPG%THERMAL_EQUILIBRIUM .OR. (.NOT. GPG%SOLVE_GAS_ENERGY)) THEN
+         WHERE (GPROP%CPG*G%TPN(:,:,:) - G%HI(RXN(IRXN)%IFROM,:,:,:) .GT. 0D0) G%SHM(:,:,:) = G%SHM(:,:,:) + G%OMEGASFGK(IRXN,:,:,:)*(GPROP%CPG*G%TPN(:,:,:)-G%HI(RXN(IRXN)%IFROM,:,:,:))
+         WHERE (GPROP%CPG*G%TPN(:,:,:) - G%HI(RXN(IRXN)%IFROM,:,:,:) .LT. 0D0) G%SHP(:,:,:) = G%SHP(:,:,:) + G%OMEGASFGK(IRXN,:,:,:)*(GPROP%CPG*G%TPN(:,:,:)-G%HI(RXN(IRXN)%IFROM,:,:,:))
+      ELSE
+         WHERE (GPROP%CPG*G%TGN(:,:,:) - G%HI(RXN(IRXN)%IFROM,:,:,:) .GT. 0D0) G%SHM(:,:,:) = G%SHM(:,:,:) + G%OMEGASFGK(IRXN,:,:,:)*(GPROP%CPG*G%TGN(:,:,:)-G%HI(RXN(IRXN)%IFROM,:,:,:))
+         WHERE (GPROP%CPG*G%TGN(:,:,:) - G%HI(RXN(IRXN)%IFROM,:,:,:) .LT. 0D0) G%SHP(:,:,:) = G%SHP(:,:,:) + G%OMEGASFGK(IRXN,:,:,:)*(GPROP%CPG*G%TGN(:,:,:)-G%HI(RXN(IRXN)%IFROM,:,:,:))      
+      ENDIF
+   ENDDO
+ENDIF
+
+! Volumetric heat losses:	
+IF (GPG%VHLC .GT. 0D0) G%SHM(:,:,:)=G%SHM(:,:,:) + GPG%VHLC*(G%TPN(:,:,:)-GPG%TAMB)
+
+! Gas-phase energy source terms:
+IF (GPG%SOLVE_GAS_ENERGY .AND. (.NOT. GPG%THERMAL_EQUILIBRIUM)) THEN
+   IF (GPG%HCV .LT. 0D0) THEN
+      G%SHGP(:,:,:) = G%HCV(:,:,:)*G%TPN(:,:,:)
+      G%SHGM(:,:,:) = G%HCV(:,:,:)*G%TGN(:,:,:)
+   ELSE
+      G%SHGP(:,:,:) = GPG%HCV*G%TPN(:,:,:)
+      G%SHGM(:,:,:) = GPG%HCV*G%TGN(:,:,:)
+   ENDIF
+
+!These terms cancel with -omegasfg * hg only if gases are produced at Tgas (not Tsolid)
+   IF (GPG%GASES_PRODUCED_AT_TSOLID) THEN
+!$omp PARALLEL DO SCHEDULE(STATIC)
+      DO IY = 1, NCELLY
+      DO IX = 1, NCELLX
+      DO IZ = 1, NCELLZ
+      DO IGSPEC = 1, GPROP%NGSPEC
+         G%SHGP(IZ,IX,IY) = G%SHGP(IZ,IX,IY) + GPROP%CPG * (G%TPN(IZ,IX,IY) - GPG%TDATUM) * G%GOMEGA (1,IGSPEC,IZ,IX,IY) ! 1
+         G%SHGM(IZ,IX,IY) = G%SHGM(IZ,IX,IY) + GPROP%CPG * (G%TPN(IZ,IX,IY) - GPG%TDATUM) * G%GOMEGA (2,IGSPEC,IZ,IX,IY) ! 3
+      ENDDO
+      ENDDO
+      ENDDO
+      ENDDO
+!$omp END PARALLEL DO
+   ENDIF
+         
+   DO IRXN = 1, GPROP%NHGRXN
+      IF (HGRXN(IRXN)%DH .LT. 0D0) THEN !Exothermic
+         G%SHGP(:,:,:) = G%SHGP(:,:,:) - G%HGRR(IRXN,:,:,:) * HGRXN(IRXN)%DH
+      ELSE
+         G%SHGM(:,:,:) = G%SHGM(:,:,:) + G%HGRR(IRXN,:,:,:) * HGRXN(IRXN)%DH
+      ENDIF         
+   ENDDO
+ENDIF
+
+CALL GET_CPU_TIME(TEND)
+GPG%TUSED(11) = GPG%TUSED(11) + TEND - TSTART 
+
+! *****************************************************************************
+END SUBROUTINE ENERGY_SOURCE_TERMS
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE CALCULATE_INTERFACE_WEIGHTING_FACTORS(IMESH)
+! *****************************************************************************
+! Calculate weighting factors
+
+INTEGER,INTENT(IN) :: IMESH
+INTEGER :: NCELLZ,NCELLX,NCELLY,IZ,IX,IY
+REAL(EB) :: TSTART, TEND
+
+CALL GET_CPU_TIME(TSTART)
+
+G => GPM(IMESH)
+GPBCP(1:,1:,1:,-3:)=>G%GPYRO_BOUNDARY_CONDITION(1:,1:,1:,-3:)
+
+NCELLZ = G%NCELLZ
+NCELLX = G%NCELLX
+NCELLY = G%NCELLY
+
+!z-direction:
+G%FB(NCELLZ,:,:) = 0D0
+DO IZ = 1, NCELLZ-1
+   G%FB(IZ,:,:) = G%DLTZN(IZ+1,:,:) / (G%DLTZN(IZ+1,:,:) + G%DLTZN(IZ,:,:))
+ENDDO
+
+G%FT(1,:,:) = 0D0
+DO IZ = 2, NCELLZ
+   G%FT(IZ,:,:) = G%DLTZN(IZ-1,:,:) / (G%DLTZN(IZ-1,:,:) + G%DLTZN(IZ,:,:))
+ENDDO
+
+!x-direction:
+IF (NCELLX .GT. 1) THEN
+   G%FE(:,NCELLX,:) = 0D0
+   DO IX = 1, NCELLX-1
+      G%FE(:,IX,:) = G%DLTXN(:,IX+1,:) / (G%DLTXN(:,IX+1,:) + G%DLTXN(:,IX,:))
+   ENDDO
+
+   G%FW(:,1,:) = 0D0
+   DO IX = 2, NCELLX
+      G%FW(:,IX,:) = G%DLTXN(:,IX-1,:) / (G%DLTXN(:,IX-1,:) + G%DLTXN(:,IX,:))
+   ENDDO
+ENDIF
+
+!y-direction:
+IF (NCELLY .GT. 1 .AND. NCELLX .GT. 1) THEN
+   G%FN(:,:,NCELLY) = 0D0
+   DO IY = 1, NCELLY-1
+      G%FN(:,:,IY) = G%DLTYN(:,:,IY+1) / (G%DLTYN(:,:,IY+1) + G%DLTYN(:,:,IY))
+   ENDDO
+
+   G%FS(:,:,1) = 0D0
+   DO IY = 2, NCELLY
+      G%FS(:,:,IY) = G%DLTYN(:,:,IY-1) / (G%DLTYN(:,:,IY-1) + G%DLTYN(:,:,IY))
+   ENDDO
+ENDIF
+
+CALL GET_CPU_TIME(TEND)
+GPG%TUSED(12) = GPG%TUSED(12) + TEND - TSTART 
+
+! *****************************************************************************
+END SUBROUTINE CALCULATE_INTERFACE_WEIGHTING_FACTORS
+! *****************************************************************************
+
+!This generalized routine calculates interface quantities:
+! *****************************************************************************
+SUBROUTINE CALCULATE_INTERFACE_QUANTITIES(IMESH,CQUANTITY,ISPEC)
+! *****************************************************************************
+
+INTEGER, INTENT(IN) :: IMESH,ISPEC
+CHARACTER(9), INTENT(IN) :: CQUANTITY
+
+REAL(EB), POINTER, DIMENSION(:,:,:) :: GAMPZ, GAMPX, GAMPY !"Gamma", from Patankar nomenclature 
+REAL(EB), POINTER, DIMENSION(:,:,:) :: GAMT,GAMB,GAME,GAMW,GAMN,GAMS
+
+INTEGER :: IZ,IX,IY,NCELLZ,NCELLX,NCELLY
+REAL(EB) :: TSTART, TEND
+
+REAL(EB), PARAMETER :: EPS = 1D-20
+
+CALL GET_CPU_TIME(TSTART)
+
+G => GPM(IMESH)
+GPBCP(1:,1:,1:,-3:)=>G%GPYRO_BOUNDARY_CONDITION(1:,1:,1:,-3:)
+
+NCELLZ = G%NCELLZ
+NCELLX = G%NCELLX
+NCELLY = G%NCELLY
+
+GAMPZ => G%RWORK01
+GAMPX => G%RWORK02
+GAMPY => G%RWORK03
+
+SELECT CASE(TRIM(CQUANTITY))
+   CASE('KOC')
+
+      IF (G%NCELLZ .GT. 1 .AND. G%NCELLX .LE. 1) THEN
+         IX = 1 ; IY = 1
+         !$omp PARALLEL DO SCHEDULE(STATIC)
+         DO IZ = 1, NCELLZ
+             GAMPZ(IZ,IX,IY) = (G%KZ(IZ,IX,IY) + G%KRZ(IZ,IX,IY)) / G%CPS(IZ,IX,IY) !Gamma-z (point)
+         ENDDO
+         !$omp END PARALLEL DO
+
+         GAMT => G%KOCT
+         GAMB => G%KOCB
+      ENDIF
+
+      IF (G%NCELLZ .GT. 1  .AND. G%NCELLX .GT. 1 .AND. G%NCELLY .LE. 1) THEN
+         IY = 1
+         !$omp PARALLEL DO SCHEDULE(STATIC)
+         DO IX = 1, NCELLX
+         DO IZ = 1, NCELLZ
+            GAMPZ(IZ,IX,IY) = (G%KZ(IZ,IX,IY) + G%KRZ(IZ,IX,IY)) / G%CPS(IZ,IX,IY) !Gamma-z (point)
+            GAMPX(IZ,IX,IY) = (G%KX(IZ,IX,IY) + G%KRX(IZ,IX,IY)) / G%CPS(IZ,IX,IY) !Gamma-x (point)
+         ENDDO
+         ENDDO
+         !$omp END PARALLEL DO
+         GAMT => G%KOCT
+         GAMB => G%KOCB
+         GAME => G%KOCE
+         GAMW => G%KOCW
+      ENDIF
+
+      IF (G%NCELLZ .GT. 1 .AND. G%NCELLX .GT. 1 .AND. G%NCELLY .GT. 1) THEN
+         !$omp PARALLEL DO SCHEDULE(STATIC)
+         DO IY = 1, NCELLY
+         DO IX = 1, NCELLX
+         DO IZ = 1, NCELLZ
+            GAMPZ(IZ,IX,IY) = (G%KZ(IZ,IX,IY) + G%KRZ(IZ,IX,IY)) / G%CPS(IZ,IX,IY) !Gamma-z (point)
+            GAMPX(IZ,IX,IY) = (G%KX(IZ,IX,IY) + G%KRX(IZ,IX,IY)) / G%CPS(IZ,IX,IY) !Gamma-x (point)
+            GAMPY(IZ,IX,IY) = (G%KY(IZ,IX,IY) + G%KRY(IZ,IX,IY)) / G%CPS(IZ,IX,IY) !Gamma-y (point)
+         ENDDO
+         ENDDO
+         ENDDO
+         !$omp END PARALLEL DO
+         GAMT => G%KOCT
+         GAMB => G%KOCB
+         GAME => G%KOCE
+         GAMW => G%KOCW
+         GAMN => G%KOCN
+         GAMS => G%KOCS
+      ENDIF
+
+   CASE('KOCHI')
+
+      IF (G%NCELLZ .GT. 1 .AND. G%NCELLX .LE. 1) THEN
+         IX = 1; IY = 1
+         !$omp PARALLEL DO SCHEDULE(STATIC)
+         DO IZ = 1, NCELLZ
+            GAMPZ(IZ,IX,IY) = (G%KZ(IZ,IX,IY) / G%CPS(IZ,IX,IY)) * G%HI(ISPEC,IZ,IX,IY) !Gamma-z (point)
+         ENDDO
+         !$omp END PARALLEL DO
+         GAMT => G%KOCHIT(ISPEC,:,:,:)
+         GAMB => G%KOCHIB(ISPEC,:,:,:)
+      ENDIF
+
+      IF (G%NCELLZ .GT. 1  .AND. G%NCELLX .GT. 1 .AND. G%NCELLY .LE. 1) THEN
+         IY = 1
+         !$omp PARALLEL DO SCHEDULE(STATIC)
+         DO IX = 1, NCELLX
+         DO IZ = 1, NCELLZ
+            GAMPZ(IZ,IX,IY) = (G%KZ(IZ,IX,IY) / G%CPS(IZ,IX,IY)) * G%HI(ISPEC,IZ,IX,IY) !Gamma-z (point)
+            GAMPX(IZ,IX,IY) = (G%KX(IZ,IX,IY) / G%CPS(IZ,IX,IY)) * G%HI(ISPEC,IZ,IX,IY) !Gamma-x (point)
+         ENDDO
+         ENDDO
+         !$omp END PARALLEL DO
+         GAMT => G%KOCHIT(ISPEC,:,:,:)
+         GAMB => G%KOCHIB(ISPEC,:,:,:)
+         GAME => G%KOCHIE(ISPEC,:,:,:)
+         GAMW => G%KOCHIW(ISPEC,:,:,:)
+      ENDIF
+
+      IF (G%NCELLZ .GT. 1 .AND. G%NCELLX .GT. 1 .AND. G%NCELLY .GT. 1) THEN
+         !$omp PARALLEL DO SCHEDULE(STATIC)
+         DO IY = 1, NCELLY
+         DO IX = 1, NCELLX
+         DO IZ = 1, NCELLZ
+            GAMPZ(IZ,IX,IY) = (G%KZ(IZ,IX,IY) / G%CPS(IZ,IX,IY)) * G%HI(ISPEC,IZ,IX,IY) !Gamma-z (point)
+            GAMPX(IZ,IX,IY) = (G%KX(IZ,IX,IY) / G%CPS(IZ,IX,IY)) * G%HI(ISPEC,IZ,IX,IY) !Gamma-x (point)
+            GAMPY(IZ,IX,IY) = (G%KY(IZ,IX,IY) / G%CPS(IZ,IX,IY)) * G%HI(ISPEC,IZ,IX,IY) !Gamma-y (point)
+         ENDDO
+         ENDDO
+         ENDDO
+         !$omp END PARALLEL DO
+         GAMT => G%KOCHIT(ISPEC,:,:,:)
+         GAMB => G%KOCHIB(ISPEC,:,:,:)
+         GAME => G%KOCHIE(ISPEC,:,:,:)
+         GAMW => G%KOCHIW(ISPEC,:,:,:)
+         GAMN => G%KOCHIN(ISPEC,:,:,:)
+         GAMS => G%KOCHIS(ISPEC,:,:,:)
+      ENDIF
+      
+   CASE('PERMONU')
+
+      IF (G%NCELLZ .GT. 1 .AND. G%NCELLX .LE. 1) THEN
+         IX = 1; IY = 1
+         !$omp PARALLEL DO SCHEDULE(STATIC)
+         DO IZ = 1, NCELLZ
+            GAMPZ(IZ,IX,IY) = G%PERMZ(IZ,IX,IY) / G%D12(IZ,IX,IY) !Gamma-z (point)
+            IF(G%IMASK(IZ,IX,IY) .EQ. 0D0) GAMPZ(IZ,IX,IY) = GAMPZ(IZ,IX,IY) * 1D6
+         ENDDO
+         !$omp END PARALLEL DO
+         GAMT => G%PERMONUT
+         GAMB => G%PERMONUB
+      ENDIF
+
+      IF (G%NCELLZ .GT. 1  .AND. G%NCELLX .GT. 1 .AND. G%NCELLY .LE. 1) THEN
+         IY = 1
+         !$omp PARALLEL DO SCHEDULE(STATIC)
+         DO IX = 1, NCELLX
+         DO IZ = 1, NCELLZ
+            GAMPZ(IZ,IX,IY) = G%PERMZ(IZ,IX,IY) / G%D12(IZ,IX,IY) !Gamma-z (point)
+            GAMPX(IZ,IX,IY) = G%PERMX(IZ,IX,IY) / G%D12(IZ,IX,IY) !Gamma-x (point)
+            IF(G%IMASK(IZ,IX,IY) .EQ. 0D0) THEN 
+               GAMPZ(IZ,IX,IY) = GAMPZ(IZ,IX,IY) * 1D6
+               GAMPX(IZ,IX,IY) = GAMPX(IZ,IX,IY) * 1D6
+            ENDIF
+         ENDDO
+         ENDDO
+         !$omp END PARALLEL DO
+         GAMT => G%PERMONUT
+         GAMB => G%PERMONUB
+         GAME => G%PERMONUE
+         GAMW => G%PERMONUW
+      ENDIF
+
+      IF (G%NCELLZ .GT. 1 .AND. G%NCELLX .GT. 1 .AND. G%NCELLY .GT. 1) THEN
+         !$omp PARALLEL DO SCHEDULE(STATIC)
+         DO IY = 1, NCELLY
+         DO IX = 1, NCELLX
+         DO IZ = 1, NCELLZ
+            GAMPZ(IZ,IX,IY) = G%PERMZ(IZ,IX,IY) / G%D12(IZ,IX,IY) !Gamma-z (point)
+            GAMPX(IZ,IX,IY) = G%PERMX(IZ,IX,IY) / G%D12(IZ,IX,IY) !Gamma-x (point)
+            GAMPY(IZ,IX,IY) = G%PERMY(IZ,IX,IY) / G%D12(IZ,IX,IY) !Gamma-y (point)
+            IF(G%IMASK(IZ,IX,IY) .EQ. 0D0) THEN 
+               GAMPZ(IZ,IX,IY) = GAMPZ(IZ,IX,IY) * 1D6
+               GAMPX(IZ,IX,IY) = GAMPX(IZ,IX,IY) * 1D6
+               GAMPY(IZ,IX,IY) = GAMPY(IZ,IX,IY) * 1D6
+            ENDIF
+         ENDDO
+         ENDDO
+         ENDDO
+         !$omp END PARALLEL DO
+         GAMT => G%PERMONUT
+         GAMB => G%PERMONUB
+         GAME => G%PERMONUE
+         GAMW => G%PERMONUW
+         GAMN => G%PERMONUN
+         GAMS => G%PERMONUS
+      ENDIF
+
+   CASE('PSIRGD')
+
+      IF (G%NCELLZ .GT. 1) THEN
+         !$omp PARALLEL DO SCHEDULE(STATIC)
+         DO IY = 1, NCELLY
+         DO IX = 1, NCELLX
+         DO IZ = 1, NCELLZ
+            GAMPZ(IZ,IX,IY) = GPG%TORTUOSITY_FACTOR * G%POROSS(IZ,IX,IY) * G%RGN(IZ,IX,IY) * G%D12(IZ,IX,IY) !Gamma-z (point)
+         ENDDO
+         ENDDO
+         ENDDO
+         !$omp END PARALLEL DO
+         GAMT => G%PSIRGDT
+         GAMB => G%PSIRGDB
+      ENDIF
+
+      IF (G%NCELLX .GT. 1) THEN
+         GAMPX = GAMPZ
+         GAME => G%PSIRGDE
+         GAMW => G%PSIRGDW
+      ENDIF
+
+      IF (G%NCELLY .GT. 1) THEN
+         GAMPY = GAMPZ
+         GAMN => G%PSIRGDN
+         GAMS => G%PSIRGDS
+      ENDIF
+
+   CASE('RG')
+
+      IF (G%NCELLZ .GT. 1) THEN
+         GAMPZ = G%RGN !Gamma-z (point)
+         GAMT => G%RGNT
+         GAMB => G%RGNB
+      ENDIF
+
+      IF (G%NCELLX .GT. 1) THEN   
+         GAMPX = GAMPZ !G%RGN !Gamma-x (point)
+         GAME => G%RGNE
+         GAMW => G%RGNW
+      ENDIF
+
+      IF (G%NCELLY .GT. 1) THEN   
+         GAMPY = GAMPZ !G%RGN !Gamma-y (point)
+         GAMN => G%RGNN
+         GAMS => G%RGNS
+      ENDIF
+
+   CASE DEFAULT
+
+      CONTINUE
+          
+END SELECT
+
+IF (G%NCELLZ .GT. 1 .AND. G%NCELLX .EQ. 1) THEN
+   IX = 1; IY = 1
+   !$omp PARALLEL DO SCHEDULE(STATIC)
+   DO IZ = 1, NCELLZ
+      IF (GAMPZ(IZ,IX,IY) .LT. EPS) GAMPZ(IZ,IX,IY) = EPS
+   ENDDO
+   !$omp END PARALLEL DO
+ENDIF
+
+IF (G%NCELLZ .GT. 1 .AND. G%NCELLX .GT. 1 .AND. G%NCELLY .EQ. 1) THEN 
+   IY = 1
+   !$omp PARALLEL DO SCHEDULE(STATIC)
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+      IF (GAMPZ(IZ,IX,IY) .LT. EPS) GAMPZ(IZ,IX,IY) = EPS
+      IF (GAMPX(IZ,IX,IY) .LT. EPS) GAMPX(IZ,IX,IY) = EPS
+   ENDDO
+   ENDDO
+   !$omp END PARALLEL DO
+ENDIF
+
+IF (G%NCELLZ .GT. 1 .AND. G%NCELLX .GT. 1 .AND. G%NCELLY .GT. 1) THEN
+   !$omp PARALLEL DO SCHEDULE(STATIC)
+   DO IY = 1, NCELLY
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+      IF (GAMPZ(IZ,IX,IY) .LT. EPS) GAMPZ(IZ,IX,IY) = EPS
+      IF (GAMPX(IZ,IX,IY) .LT. EPS) GAMPX(IZ,IX,IY) = EPS
+      IF (GAMPY(IZ,IX,IY) .LT. EPS) GAMPY(IZ,IX,IY) = EPS
+   ENDDO
+   ENDDO
+   ENDDO
+   !$omp END PARALLEL DO 
+ENDIF
+
+!Calculate gamma in z-direction:
+GAMB(NCELLZ,:,:) = 0D0
+GAMT(1,     :,:) = 0D0
+
+!$omp PARALLEL DO SCHEDULE(STATIC)
+DO IY = 1, NCELLY
+DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ - 1
+      GAMB(IZ,IX,IY) = 1D0 / ((1D0-G%FB(IZ,IX,IY))/GAMPZ(IZ,IX,IY) + G%FB(IZ,IX,IY)/GAMPZ(IZ+1,IX,IY))
+   ENDDO
+   DO IZ = 2, NCELLZ
+      GAMT(IZ,IX,IY) = GAMB(IZ-1,IX,IY)
+   ENDDO
+ENDDO
+ENDDO
+!$omp END PARALLEL DO
+
+!Calculate gamma in x-direction:
+IF (NCELLX .GT. 1) THEN
+   GAME(:,NCELLX,:) = 0D0
+   GAMW(:,1     ,:) = 0D0
+
+   !$omp PARALLEL DO SCHEDULE(STATIC)
+   DO IZ = 1, NCELLZ
+   DO IY = 1, NCELLY   
+      DO IX = 1, NCELLX - 1
+         GAME(IZ,IX,IY) = 1D0 /  ((1D0-G%FE(IZ,IX,IY))/GAMPX(IZ,IX,IY) + G%FE(IZ,IX,IY)/GAMPX(IZ,IX+1,IY))
+      ENDDO
+      DO IX = 2, NCELLX
+         GAMW(IZ,IX,IY) = GAME(IZ,IX-1,IY)
+      ENDDO
+   ENDDO
+   ENDDO
+   !$omp END PARALLEL DO
+ENDIF
+
+!Calculate gamma in y-direction:
+IF (NCELLY .GT. 1 .AND. NCELLX .GT. 1) THEN
+   GAMN(:,:,NCELLY) = 0D0
+   GAMS(:,:,1     ) = 0D0
+
+   !$omp PARALLEL DO SCHEDULE(STATIC)
+   DO IX = 1, NCELLX
+   DO IZ = 1, NCELLZ
+      DO IY = 1, NCELLY - 1
+         GAMN(IZ,IX,IY) = 1D0 / ((1D0-G%FN(IZ,IX,IY))/GAMPY(IZ,IX,IY) + G%FN(IZ,IX,IY)/GAMPY(IZ,IX,IY+1))
+      ENDDO
+      DO IY = 2, NCELLY
+         GAMS(IZ,IX,IY) = GAMN(IZ,IX,IY-1)
+      ENDDO
+   ENDDO
+   ENDDO
+   !$omp END PARALLEL DO
+
+ENDIF
+
+CALL GET_CPU_TIME(TEND)
+GPG%TUSED(13) = GPG%TUSED(13) + TEND - TSTART 
+
+! *****************************************************************************
+END SUBROUTINE CALCULATE_INTERFACE_QUANTITIES
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE CALCULATE_WEIGHTED_POINT_QUANTITIES(IMESH,TMPCONVERGED,PCONVERGED,YISCONVERGED0)
+! *****************************************************************************
+
+INTEGER, INTENT(IN) :: IMESH
+LOGICAL, INTENT(IN) :: TMPCONVERGED,PCONVERGED,YISCONVERGED0
+INTEGER :: IZ,IX,IY,ISPEC,I,J
+REAL(EB) :: TSTART, TEND, NUMER, DENOM, OMPOROS, FPOROS
+
+CALL GET_CPU_TIME(TSTART)
+
+G => GPM(IMESH)
+GPBCP(1:,1:,1:,-3:)=>G%GPYRO_BOUNDARY_CONDITION(1:,1:,1:,-3:)
+
+! Calculate volume fraction:
+IF ( (.NOT. TMPCONVERGED) .OR. (.NOT. YISCONVERGED0)) THEN
+!$omp PARALLEL DO SCHEDULE(STATIC)
+   DO IY = 1, G%NCELLY
+   DO IX = 1, G%NCELLX
+   DO IZ = 1, G%NCELLZ
+      DO ISPEC = 1, SPROP%NSSPEC   
+         G%XIN(ISPEC,IZ,IX,IY)=G%RPN(IZ,IX,IY)*G%YIN(ISPEC,IZ,IX,IY) / RHOOFT(ISPEC,G%TPN(IZ,IX,IY)) 
+      ENDDO
+   ENDDO
+   ENDDO
+   ENDDO
+!$omp END PARALLEL DO
+ENDIF
+
+IF (.NOT. TMPCONVERGED) THEN
+
+   IF (G%ORIENTATION_FILE_EXISTS) THEN
+
+!$omp PARALLEL DO SCHEDULE(STATIC)
+      DO IY = 1, G%NCELLY
+      DO IX = 1, G%NCELLX
+      DO IZ = 1, G%NCELLZ
+
+         G%KZ (IZ,IX,IY) = 0D0
+         G%KX (IZ,IX,IY) = 0D0 
+         G%KY (IZ,IX,IY) = 0D0 
+         G%K_TENSOR(IZ,IX,IY,:,:) = 0D0
+
+         IF (G%IMASK(IZ,IX,IY) .EQ. 0) THEN
+            G%CPS(IZ,IX,IY) = CPOFT(1,G%TP(IZ,IX,IY))
+         ELSE
+            G%CPS(IZ,IX,IY) = 0D0
+            DO ISPEC = 1, SPROP%NSSPEC
+! Heat capacity
+               G%CPS(IZ,IX,IY) = G%CPS(IZ,IX,IY) + G%YIN(ISPEC,IZ,IX,IY)*CPOFT(ISPEC,G%TPN(IZ,IX,IY))
+
+! Thermal conductivity
+               IF (GPG%ANISOTROPIC_SPECIES(ISPEC)) THEN
+                  DO I = 1, 3 
+                  DO J = 1, 3
+                     G%K_TENSOR(IZ,IX,IY,I,J) = G%XIN(ISPEC,IZ,IX,IY) * ( G%ORI(IZ,IX,IY,1,I) * G%ORI(IZ,IX,IY,1,J) * G%XIN(ISPEC,IZ,IX,IY) * KXOFT(ISPEC,G%TPN(IZ,IX,IY)) + & 
+                                                                          G%ORI(IZ,IX,IY,2,I) * G%ORI(IZ,IX,IY,2,J) * G%XIN(ISPEC,IZ,IX,IY) * KYOFT(ISPEC,G%TPN(IZ,IX,IY)) + &
+                                                                          G%ORI(IZ,IX,IY,3,I) * G%ORI(IZ,IX,IY,3,J) * G%XIN(ISPEC,IZ,IX,IY) * KZOFT(ISPEC,G%TPN(IZ,IX,IY))     )
+                  ENDDO
+                  ENDDO
+               ELSE 
+                  G%KZ (IZ,IX,IY) = G%KZ (IZ,IX,IY) + G%XIN(ISPEC,IZ,IX,IY)*KZOFT(ISPEC,G%TPN(IZ,IX,IY))
+                  G%KX (IZ,IX,IY) = G%KX (IZ,IX,IY) + G%XIN(ISPEC,IZ,IX,IY)*KXOFT(ISPEC,G%TPN(IZ,IX,IY))
+                  G%KY (IZ,IX,IY) = G%KY (IZ,IX,IY) + G%XIN(ISPEC,IZ,IX,IY)*KYOFT(ISPEC,G%TPN(IZ,IX,IY))
+               ENDIF
+
+            ENDDO !ISPEC
+
+            G%K_TENSOR(IZ,IX,IY,1,1) = G%K_TENSOR(IZ,IX,IY,1,1) + G%KX(IZ,IX,IY)
+            G%K_TENSOR(IZ,IX,IY,2,2) = G%K_TENSOR(IZ,IX,IY,2,2) + G%KY(IZ,IX,IY)
+            G%K_TENSOR(IZ,IX,IY,3,3) = G%K_TENSOR(IZ,IX,IY,3,3) + G%KZ(IZ,IX,IY)
+
+! This is a temporary hack:
+            G%KX(IZ,IX,IY) = G%K_TENSOR(IZ,IX,IY,1,1)
+            G%KY(IZ,IX,IY) = G%K_TENSOR(IZ,IX,IY,2,2)
+            G%KZ(IZ,IX,IY) = G%K_TENSOR(IZ,IX,IY,3,3)
+
+!            IF (G%K_TENSOR(IZ,IX,IY,1,1) .GT. 1D0) THEN
+!                CONTINUE
+!            ENDIF
+
+         ENDIF
+
+      ENDDO
+      ENDDO
+      ENDDO
+!$omp END PARALLEL DO
+
+   ELSE !No orientation file
+
+!$omp PARALLEL DO SCHEDULE(STATIC)
+      DO IY = 1, G%NCELLY
+      DO IX = 1, G%NCELLX
+      DO IZ = 1, G%NCELLZ
+
+         G%KZ (IZ,IX,IY) = 0D0
+         G%KX (IZ,IX,IY) = 0D0 
+         G%KY (IZ,IX,IY) = 0D0 
+
+         IF (G%IMASK(IZ,IX,IY) .EQ. 0) THEN
+            G%CPS(IZ,IX,IY) = CPOFT(1,G%TP(IZ,IX,IY))
+         ELSE
+            G%CPS(IZ,IX,IY) = 0D0
+
+            DO ISPEC = 1, SPROP%NSSPEC
+               G%KZ (IZ,IX,IY) = G%KZ (IZ,IX,IY) + G%XIN(ISPEC,IZ,IX,IY)*KZOFT(ISPEC,G%TPN(IZ,IX,IY))
+               G%KX (IZ,IX,IY) = G%KX (IZ,IX,IY) + G%XIN(ISPEC,IZ,IX,IY)*KXOFT(ISPEC,G%TPN(IZ,IX,IY))
+               G%KY (IZ,IX,IY) = G%KY (IZ,IX,IY) + G%XIN(ISPEC,IZ,IX,IY)*KYOFT(ISPEC,G%TPN(IZ,IX,IY))
+               G%CPS(IZ,IX,IY) = G%CPS(IZ,IX,IY) + G%YIN(ISPEC,IZ,IX,IY)*CPOFT(ISPEC,G%TPN(IZ,IX,IY))
+            ENDDO
+         ENDIF
+      ENDDO
+      ENDDO
+      ENDDO
+!$omp END PARALLEL DO
+   ENDIF
+
+   G%KRZ(:,:,:) = 0D0
+   G%KRX(:,:,:) = 0D0
+   G%KRY(:,:,:) = 0D0
+
+   DO ISPEC = 1, SPROP%NSSPEC   
+      IF (SPROP%GAMMA(ISPEC) .GT. 0D0) THEN 
+!$omp PARALLEL DO SCHEDULE(STATIC)
+         DO IZ = 1, G%NCELLZ
+         DO IX = 1, G%NCELLX
+         DO IY = 1, G%NCELLY
+            IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+            G%KRZ(IZ,IX,IY) = G%KRZ(IZ,IX,IY) + G%XIN(ISPEC,IZ,IX,IY)*SPROP%GAMMA(ISPEC)*5.67D-8*G%TPN(IZ,IX,IY)*G%TPN(IZ,IX,IY)*G%TPN(IZ,IX,IY)
+            G%KRX(IZ,IX,IY) = G%KRX(IZ,IX,IY) + G%XIN(ISPEC,IZ,IX,IY)*SPROP%GAMMA(ISPEC)*5.67D-8*G%TPN(IZ,IX,IY)*G%TPN(IZ,IX,IY)*G%TPN(IZ,IX,IY)
+            G%KRY(IZ,IX,IY) = G%KRY(IZ,IX,IY) + G%XIN(ISPEC,IZ,IX,IY)*SPROP%GAMMA(ISPEC)*5.67D-8*G%TPN(IZ,IX,IY)*G%TPN(IZ,IX,IY)*G%TPN(IZ,IX,IY)
+         ENDDO
+         ENDDO
+         ENDDO
+!$omp END PARALLEL DO
+      ENDIF
+   ENDDO
+
+ENDIF
+
+IF (GPG%SOLVE_PRESSURE .AND. (.NOT. PCONVERGED)) THEN
+   IF (GPG%KOZENY_CARMAN) THEN
+
+!$omp PARALLEL DO SCHEDULE(STATIC)
+      DO IY = 1, G%NCELLY
+      DO IX = 1, G%NCELLX
+      DO IZ = 1, G%NCELLZ
+
+         G%PERMZ(IZ,IX,IY) = 0D0
+         G%PERMX(IZ,IX,IY) = 0D0
+         G%PERMY(IZ,IX,IY) = 0D0
+
+         IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+
+         NUMER   = G%POROSSN(IZ,IX,IY) * G%POROSSN(IZ,IX,IY) * G%POROSSN(IZ,IX,IY)
+         OMPOROS = 1D0 - G%POROSSN(IZ,IX,IY)
+         DENOM   = MAX(OMPOROS*OMPOROS, 1D-20)
+         FPOROS  = NUMER / DENOM
+
+         DO ISPEC = 1, SPROP%NSSPEC
+            G%PERMZ(IZ,IX,IY) = G%PERMZ(IZ,IX,IY) + G%XIN(ISPEC,IZ,IX,IY) * SPROP%PERMZ(ISPEC) * FPOROS
+            G%PERMX(IZ,IX,IY) = G%PERMX(IZ,IX,IY) + G%XIN(ISPEC,IZ,IX,IY) * SPROP%PERMX(ISPEC) * FPOROS
+            G%PERMY(IZ,IX,IY) = G%PERMY(IZ,IX,IY) + G%XIN(ISPEC,IZ,IX,IY) * SPROP%PERMY(ISPEC) * FPOROS
+         ENDDO
+
+      ENDDO
+      ENDDO
+      ENDDO
+!$omp END PARALLEL DO
+
+
+   ELSE
+    
+!$omp PARALLEL DO SCHEDULE(STATIC)
+      DO IY = 1, G%NCELLY
+      DO IX = 1, G%NCELLX
+      DO IZ = 1, G%NCELLZ
+
+         G%PERMZ(IZ,IX,IY) = 0D0
+         G%PERMX(IZ,IX,IY) = 0D0
+         G%PERMY(IZ,IX,IY) = 0D0
+
+         IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+
+         DO ISPEC = 1, SPROP%NSSPEC   
+            G%PERMZ(IZ,IX,IY) = G%PERMZ(IZ,IX,IY) + G%XIN(ISPEC,IZ,IX,IY)*SPROP%PERMZ(ISPEC)   
+            G%PERMX(IZ,IX,IY) = G%PERMX(IZ,IX,IY) + G%XIN(ISPEC,IZ,IX,IY)*SPROP%PERMX(ISPEC)   
+            G%PERMY(IZ,IX,IY) = G%PERMY(IZ,IX,IY) + G%XIN(ISPEC,IZ,IX,IY)*SPROP%PERMY(ISPEC)   
+         ENDDO
+
+      ENDDO
+      ENDDO
+      ENDDO
+!$omp END PARALLEL DO
+   ENDIF
+
+ENDIF
+
+!Calculate porosity:
+IF (GPG%SOLVE_GAS_ENERGY .OR. GPG%SOLVE_GAS_YJ .OR. GPG%SOLVE_PRESSURE .OR. (GPG%THERMAL_EQUILIBRIUM .AND. GPG%FULL_QSG)) THEN
+!$omp PARALLEL DO SCHEDULE(STATIC)
+   DO IY = 1, G%NCELLY
+   DO IX = 1, G%NCELLX
+   DO IZ = 1, G%NCELLZ
+      IF (G%IMASK(IZ,IX,IY) .EQ. 0) CYCLE
+!      G%POROSSN(IZ,IX,IY) = 1D0 - G%RPN(IZ,IX,IY) / G%RS0(IZ,IX,IY)
+      G%POROSSN(IZ,IX,IY) = 1D0 - G%RPN(IZ,IX,IY) / G%RSPN(IZ,IX,IY)
+      IF (G%POROSSN(IZ,IX,IY) .LT. 0D0) G%POROSSN(IZ,IX,IY) = 0D0
+      IF (G%POROSSN(IZ,IX,IY) .GT. 1D0) G%POROSSN(IZ,IX,IY) = 1D0
+   ENDDO
+   ENDDO
+   ENDDO
+!$omp END PARALLEL DO
+ENDIF
+
+CALL GET_CPU_TIME(TEND)
+GPG%TUSED(5) = GPG%TUSED(5) + TEND - TSTART 
+
+! *****************************************************************************
+END SUBROUTINE CALCULATE_WEIGHTED_POINT_QUANTITIES
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE GET_D(IMESH,NCELLZ,NCELLX,NCELLY,IBG,IO2)
+! *****************************************************************************
+
+INTEGER, INTENT(IN) :: IMESH,NCELLZ,NCELLX,NCELLY,IBG,IO2 !Background species, O2 index
+REAL(EB) :: TSTART,TEND
+REAL(EB), POINTER, DIMENSION(:,:,:) :: TSTAR,OMEGAD,NUMER,PRES
+REAL(EB), SAVE :: EPSOK = -1D0, SIG2 = -1D0, NUMER1 = -1D0 
+INTEGER :: IZ,IX,IY
+
+CALL GET_CPU_TIME(TSTART)
+
+G=>GPM(IMESH)
+
+TSTAR  => G%RWORK01
+OMEGAD => G%RWORK02
+NUMER  => G%RWORK03
+PRES   => G%RWORK04
+
+! It's assumed all species have the effective binary diffusion coefficient
+! of oxygen into the "background species", usually fuel (pyrolysate)
+IF (EPSOK .LT. 0D0) THEN
+   EPSOK  = SQRT(GPROP%EPSOK(IO2)*GPROP%EPSOK(IBG))
+   SIG2   = (0.5D0*(GPROP%SIGMA(IO2)+GPROP%SIGMA(IBG)))**2D0
+   NUMER1 = 1D0/GPROP%M(IO2) + 1D0/GPROP%M(IBG)
+ENDIF
+
+IF (GPG%SOLVE_PRESSURE) THEN
+   PRES(:,:,:) = G%PN(:,:,:)
+ELSE
+   PRES(:,:,:) = GPG%P0
+ENDIF
+
+!$omp PARALLEL DO SCHEDULE(DYNAMIC,4)
+DO IY = 1, NCELLY
+DO IX = 1, NCELLX
+DO IZ = 1, NCELLZ
+   IF (G%IMASK(IZ,IX,IY) .EQ. 0) THEN
+      G%D12(IZ,IX,IY) = 1D-20
+   ELSE
+      TSTAR (IZ,IX,IY) = G%TPN(IZ,IX,IY) / EPSOK
+      OMEGAD(IZ,IX,IY) = AD(1)*TSTAR(IZ,IX,IY)**AD(2) + AD(3)*EXP(TSTAR(IZ,IX,IY)*AD(4)) + AD(5)*EXP(AD(6)*TSTAR(IZ,IX,IY))
+      NUMER (IZ,IX,IY) = SQRT(NUMER1 * G%TPN(IZ,IX,IY)*G%TPN(IZ,IX,IY)*G%TPN(IZ,IX,IY))
+      G%D12 (IZ,IX,IY) = 0.0188129*NUMER(IZ,IX,IY) / (PRES(IZ,IX,IY)*SIG2*OMEGAD(IZ,IX,IY))
+   ENDIF
+ENDDO
+ENDDO
+ENDDO
+!$omp END PARALLEL DO
+
+CALL GET_CPU_TIME(TEND)
+GPG%TUSED(20) = GPG%TUSED(20) + TEND - TSTART
+
+! *****************************************************************************
+END SUBROUTINE GET_D
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE CALCULATE_SHYI_CORRECTION_COEFFICIENTS(NCELLZ,NCELLX,NCELLY,NSPEC,IMESH)
+! *****************************************************************************
+INTEGER, INTENT(IN) :: NCELLZ,NCELLX,NCELLY,NSPEC,IMESH
+REAL(EB), DIMENSION(1:NSPEC,1:NCELLZ) :: ATHI, ABHI
+REAL(EB), DIMENSION(1:NSPEC,1:NCELLX) :: AEHI, AWHI
+REAL(EB), DIMENSION(1:NSPEC,1:NCELLY) :: ANHI, ASHI
+
+INTEGER :: IX,IY,IZ,ISPEC
+
+REAL(EB) :: TSTART, TEND, SUBTRACTOFF
+
+CALL GET_CPU_TIME(TSTART)
+
+G=>GPM(IMESH)
+GPBCP(1:,1:,1:,-3:)=>G%GPYRO_BOUNDARY_CONDITION(1:,1:,1:,-3:)
+
+!Calculate coefficients for z-direction correction:
+
+G%SHYIDTDMAZ= 0D0
+G%SHYIAPZ   = 0D0
+
+DO IY=1,NCELLY
+DO IX=1,NCELLX
+   DO ISPEC = 1, NSPEC
+      ATHI(ISPEC,:) = G%KOCHIT(ISPEC,:,IX,IY)/G%DZT(:,IX,IY)
+      ABHI(ISPEC,:) = G%KOCHIB(ISPEC,:,IX,IY)/G%DZB(:,IX,IY)
+ 
+      G%SHYIDTDMAZ(:,IX,IY) = G%SHYIDTDMAZ(:,IX,IY) + G%YIN(ISPEC,:,IX,IY) * (ATHI(ISPEC,:) + ABHI(ISPEC,:) )
+            
+      DO IZ = 2, NCELLZ-1
+         G%SHYIAPZ(IZ,IX,IY) = G%SHYIAPZ(IZ,IX,IY) + ATHI(ISPEC,IZ) * G%YIN(ISPEC,IZ-1,IX,IY) + &
+                               ABHI(ISPEC,IZ) * G%YIN(ISPEC,IZ+1,IX,IY)
+      ENDDO
+      G%SHYIAPZ(1     ,IX,IY)=G%SHYIAPZ(1     ,IX,IY) + ABHI(ISPEC,1     )*G%YIN(ISPEC,2       ,IX,IY)
+      G%SHYIAPZ(NCELLZ,IX,IY)=G%SHYIAPZ(NCELLZ,IX,IY) + ATHI(ISPEC,NCELLZ)*G%YIN(ISPEC,NCELLZ-1,IX,IY)
+   ENDDO
+   
+   G%SHYIDTDMAZ(:,IX,IY) = G%SHYIDTDMAZ(:,IX,IY) * G%DXDY(:,IX,IY)
+   G%SHYIAPZ   (:,IX,IY) = G%SHYIAPZ   (:,IX,IY) * G%DXDY(:,IX,IY)
+
+   DO IZ = 1, NCELLZ
+      SUBTRACTOFF = MIN(G%SHYIDTDMAZ(IZ,IX,IY), G%SHYIAPZ(IZ,IX,IY))
+      G%SHYIDTDMAZ(IZ,IX,IY) = G%SHYIDTDMAZ(IZ,IX,IY) - SUBTRACTOFF
+      G%SHYIAPZ   (IZ,IX,IY) = G%SHYIAPZ   (IZ,IX,IY) - SUBTRACTOFF
+   ENDDO
+
+ENDDO
+ENDDO
+
+IF (NCELLX .GT. 1) THEN
+
+   G%SHYIDTDMAX= 0D0
+   G%SHYIAPX   = 0D0
+
+   DO IY=1,NCELLY
+   DO IZ=1,NCELLZ
+      DO ISPEC = 1, NSPEC
+         AWHI(ISPEC,:) = G%KOCHIW(ISPEC,IZ,:,IY)/G%DXW(IZ,:,IY)
+         AEHI(ISPEC,:) = G%KOCHIE(ISPEC,IZ,:,IY)/G%DXE(IZ,:,IY)
+ 
+         G%SHYIDTDMAX(IZ,:,IY) = G%SHYIDTDMAX(IZ,:,IY) + G%YIN(ISPEC,IZ,:,IY) * (AWHI(ISPEC,:) + AEHI(ISPEC,:) )
+         
+         DO IX = 2, NCELLX-1
+            G%SHYIAPX(IZ,IX,IY) = G%SHYIAPX(IZ,IX,IY) + AWHI(ISPEC,IX) * G%YIN(ISPEC,IZ,IX-1,IY) + &
+                                  AEHI(ISPEC,IX) * G%YIN(ISPEC,IZ,IX+1,IY)
+         ENDDO
+         G%SHYIAPX(IZ,1     ,IY)=G%SHYIAPX(IZ,1     ,IY) + AEHI(ISPEC,1     )*G%YIN(ISPEC,IZ,2       ,IY)
+         G%SHYIAPX(IZ,NCELLX,IY)=G%SHYIAPX(IZ,NCELLX,IY) + AWHI(ISPEC,NCELLX)*G%YIN(ISPEC,IZ,NCELLX-1,IY)
+      ENDDO
+
+      G%SHYIDTDMAX(IZ,:,IY) = G%SHYIDTDMAX(IZ,:,IY) * G%DYDZ(IZ,:,IY)
+      G%SHYIAPX   (IZ,:,IY) = G%SHYIAPX   (IZ,:,IY) * G%DYDZ(IZ,:,IY)
+
+      DO IX = 1, NCELLX
+         SUBTRACTOFF = MIN(G%SHYIDTDMAX(IZ,IX,IY), G%SHYIAPX(IZ,IX,IY))
+         G%SHYIDTDMAX(IZ,IX,IY) = G%SHYIDTDMAX(IZ,IX,IY) - SUBTRACTOFF
+         G%SHYIAPX   (IZ,IX,IY) = G%SHYIAPX   (IZ,IX,IY) - SUBTRACTOFF
+      ENDDO
+
+   ENDDO
+   ENDDO
+
+ENDIF
+
+IF (NCELLY .GT. 1 .AND. NCELLX .GT. 1) THEN
+
+   G%SHYIDTDMAY= 0D0
+   G%SHYIAPY   = 0D0
+
+   DO IX=1,NCELLX
+   DO IZ=1,NCELLZ
+      DO ISPEC = 1, NSPEC
+         ASHI(ISPEC,:) = G%KOCHIS(ISPEC,IZ,IX,:)/G%DYS(IZ,IX,:)
+         ANHI(ISPEC,:) = G%KOCHIN(ISPEC,IZ,IX,:)/G%DYN(IZ,IX,:)
+ 
+         G%SHYIDTDMAY(IZ,IX,:) = G%SHYIDTDMAY(IZ,IX,:) + G%YIN(ISPEC,IZ,IX,:) * (ASHI(ISPEC,:) + ANHI(ISPEC,:) )
+
+         DO IY = 2, NCELLY-1
+            G%SHYIAPY(IZ,IX,IY) = G%SHYIAPY(IZ,IX,IY) + ASHI(ISPEC,IY) * G%YIN(ISPEC,IZ,IX,IY-1) + &
+                                  ANHI(ISPEC,IY) * G%YIN(ISPEC,IZ,IX,IY+1)
+         ENDDO
+         G%SHYIAPY(IZ,IX,1     )=G%SHYIAPY(IZ,IX,1     ) + ANHI(ISPEC,1     )*G%YIN(ISPEC,IZ,IX,2       )
+         G%SHYIAPY(IZ,IX,NCELLY)=G%SHYIAPY(IZ,IX,NCELLY) + ASHI(ISPEC,NCELLY)*G%YIN(ISPEC,IZ,IX,NCELLY-1)
+      ENDDO
+      
+      G%SHYIDTDMAY(IZ,IX,:) = G%SHYIDTDMAY(IZ,IX,:) * G%DXDZ(IZ,IX,:)
+      G%SHYIAPY   (IZ,IX,:) = G%SHYIAPY   (IZ,IX,:) * G%DXDZ(IZ,IX,:)
+
+      DO IY = 1, NCELLY
+         SUBTRACTOFF = MIN(G%SHYIDTDMAY(IZ,IX,IY), G%SHYIAPY(IZ,IX,IY))
+         G%SHYIDTDMAY(IZ,IX,IY) = G%SHYIDTDMAY(IZ,IX,IY) - SUBTRACTOFF
+         G%SHYIAPY   (IZ,IX,IY) = G%SHYIAPY   (IZ,IX,IY) - SUBTRACTOFF
+      ENDDO
+
+   ENDDO
+   ENDDO
+   
+ENDIF
+
+CALL GET_CPU_TIME(TEND)
+GPG%TUSED(10) = GPG%TUSED(10) + TEND - TSTART
+
+! *****************************************************************************
+END SUBROUTINE CALCULATE_SHYI_CORRECTION_COEFFICIENTS
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE CALC_HCV(IMESH,NCELLZ,NCELLX,NCELLY)
+! *****************************************************************************
+INTEGER, INTENT(IN) :: IMESH,NCELLZ,NCELLX,NCELLY
+INTEGER :: IX,IY,ISPEC
+
+REAL(EB), DIMENSION (1:NCELLZ) :: MDOTPP,DP
+REAL(EB) :: TSTART, TEND
+
+CALL GET_CPU_TIME(TSTART)
+
+G=>GPM(IMESH)
+GPBCP(1:,1:,1:,-3:)=>G%GPYRO_BOUNDARY_CONDITION(1:,1:,1:,-3:)
+
+DO IY = 1, NCELLY
+DO IX = 1, NCELLX
+
+! Calculate average pore diameter:
+   DP(:) = 0D0
+   DO ISPEC = 1, SPROP%NSSPEC
+      DP(:) = DP(:) + G%YI(ISPEC,:,IX,IY) * SPROP%PORE_DIAMETER(ISPEC)
+   ENDDO
+   WHERE (DP(:) .LT. 1D-10) DP(:) = 1D-10
+
+! Get mass flux:
+   IF (GPG%SOLVE_PRESSURE) THEN
+      MDOTPP(:) =  G%MDOTPPDARCYT(:,IX,IY)
+   ELSE
+      MDOTPP(:) = -G%MDOTPPZ(0,:,IX,IY)
+   ENDIF
+
+   IF (G%NCELLX .GT. 1) THEN
+      MDOTPP(:) = SQRT(MDOTPP(:)**2D0 + G%MDOTPPDARCYE(:,IX,IY)**2D0)
+   ELSE
+      MDOTPP(:) = ABS(MDOTPP(:)) 
+   ENDIF
+      
+!Calculate Reynolds number:      
+   G%RE(:,IX,IY) = MDOTPP(:) * DP(:) / (G%RGN(:,IX,IY)*G%D12(:,IX,IY)*MAX(G%POROSSN(:,IX,IY), 1D-10) )
+      
+   G%NU(:,IX,IY) = GPG%NU_A + GPG%NU_B * G%RE(:,IX,IY)**GPG%NU_C
+      
+   G%HCV(:,IX,IY) = G%NU(:,IX,IY) * G%RGN(:,IX,IY)*G%D12(:,IX,IY)*GPROP%CPG / (DP(:)**2D0)
+
+ENDDO
+ENDDO
+
+CALL GET_CPU_TIME(TEND)
+GPG%TUSED(21) = GPG%TUSED(21) + TEND - TSTART
+
+! *****************************************************************************
+END SUBROUTINE CALC_HCV
+! *****************************************************************************
+
+! *****************************************************************************
+END MODULE GPYRO_PYRO
+! *****************************************************************************

@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<VisualStudioProject ProjectCreator="Intel Fortran" Keyword="Console Application" Version="11.0" ProjectIdGuid="{4175FFA4-6A25-49FF-9099-CE6F24F8DD08}">
+	<Platforms>
+		<Platform Name="x64"/></Platforms>
+	<Configurations>
+		<Configuration Name="Debug|x64">
+				<Tool Name="VFFortranCompilerTool" SuppressStartupBanner="true" DebugInformationFormat="debugEnabled" MultiProcessorCompilation="true" Optimization="optimizeDisabled" HeapArrays="0" AdditionalIncludeDirectories="C:\Program Files (x86)\Microsoft SDKs\MPI\Include\x64" OpenMPConditionalCompilation="false" Diagnostics="diagnosticsShowAll" WarnInterfaces="true" FloatingPointStackCheck="true" Traceback="true" RuntimeChecks="rtChecksAll" BoundsCheck="true" UninitializedVariablesCheck="true" DescriptorDataTypeCheck="true" DescriptorDataSizeCheck="true" ArgTempCreatedCheck="true" StackFrameCheck="true" RuntimeLibrary="rtQuickWinDebug"/>
+				<Tool Name="VFLinkerTool" LinkIncremental="linkIncrementalYes" SuppressStartupBanner="true" AdditionalLibraryDirectories="C:\Program Files (x86)\Microsoft SDKs\MPI\Lib\x64" GenerateDebugInformation="true" SubSystem="subSystemConsole" HeapReserveSize="50000000" HeapCommitSize="50000000" StackReserveSize="50000000" StackCommitSize="50000000" LargeAddressAware="addrAwareLarge" AdditionalDependencies="msmpi.lib msmpifec.lib"/>
+				<Tool Name="VFResourceCompilerTool"/>
+				<Tool Name="VFMidlTool" SuppressStartupBanner="true" TargetEnvironment="midlTargetAMD64"/>
+				<Tool Name="VFCustomBuildTool"/>
+				<Tool Name="VFPreLinkEventTool"/>
+				<Tool Name="VFPreBuildEventTool"/>
+				<Tool Name="VFPostBuildEventTool"/>
+				<Tool Name="VFManifestTool" SuppressStartupBanner="true"/></Configuration>
+		<Configuration Name="Release|x64">
+				<Tool Name="VFFortranCompilerTool" SuppressStartupBanner="true" MultiProcessorCompilation="true" AdditionalIncludeDirectories="C:\Program Files (x86)\Microsoft SDKs\MPI\Include\x64" RuntimeLibrary="rtMultiThreadedDLL"/>
+				<Tool Name="VFLinkerTool" LinkIncremental="linkIncrementalNo" SuppressStartupBanner="true" AdditionalLibraryDirectories="C:\Program Files (x86)\Microsoft SDKs\MPI\Lib\x64" SubSystem="subSystemConsole" HeapReserveSize="50000000" HeapCommitSize="50000000" StackReserveSize="50000000" StackCommitSize="50000000" LargeAddressAware="addrAwareLarge" AdditionalDependencies="msmpi.lib msmpifec.lib"/>
+				<Tool Name="VFResourceCompilerTool"/>
+				<Tool Name="VFMidlTool" SuppressStartupBanner="true" TargetEnvironment="midlTargetAMD64"/>
+				<Tool Name="VFCustomBuildTool"/>
+				<Tool Name="VFPreLinkEventTool"/>
+				<Tool Name="VFPreBuildEventTool"/>
+				<Tool Name="VFPostBuildEventTool"/>
+				<Tool Name="VFManifestTool" SuppressStartupBanner="true"/></Configuration></Configurations>
+	<Files>
+		<Filter Name="Header Files" Filter="fi;fd;h;inc">
+		<File RelativePath="..\..\src\ms-mpi\mpifptr.h"/></Filter>
+		<Filter Name="Resource Files" Filter="rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe"/>
+		<Filter Name="Source Files" Filter="f90;for;f;fpp;ftn;def;odl;idl">
+		<Filter Name="common">
+		<File RelativePath="..\..\src\common\gpyro_bc.f90"/>
+		<File RelativePath="..\..\src\common\gpyro_funcs.f90"/>
+		<File RelativePath="..\..\src\common\gpyro_init.f90"/>
+		<File RelativePath="..\..\src\common\gpyro_io.f90"/>
+		<File RelativePath="..\..\src\common\gpyro_prec.f90"/>
+		<File RelativePath="..\..\src\common\gpyro_pyro.f90"/>
+		<File RelativePath="..\..\src\common\gpyro_vars.f90"/></Filter>
+		<Filter Name="fds">
+		<File RelativePath="..\..\src\fds\cons.f90"/>
+		<File RelativePath="..\..\src\fds\ctrl.f90"/>
+		<File RelativePath="..\..\src\fds\data.f90"/>
+		<File RelativePath="..\..\src\fds\devc.f90"/>
+		<File RelativePath="..\..\src\fds\divg.f90"/>
+		<File RelativePath="..\..\src\fds\dump.f90"/>
+		<File RelativePath="..\..\src\fds\evac.f90"/>
+		<File RelativePath="..\..\src\fds\fire.f90"/>
+		<File RelativePath="..\..\src\fds\func.f90"/>
+		<File RelativePath="..\..\src\fds\geom.f90"/>
+		<File RelativePath="..\..\src\fds\gsmv.f90"/>
+		<File RelativePath="..\..\src\fds\hvac.f90"/>
+		<File RelativePath="..\..\src\fds\ieva.f90"/>
+		<File RelativePath="..\..\src\fds\init.f90"/>
+		<File RelativePath="..\..\src\fds\irad.f90"/>
+		<File RelativePath="..\..\src\fds\main.f90"/>
+		<File RelativePath="..\..\src\fds\mass.f90"/>
+		<File RelativePath="..\..\src\fds\mesh.f90"/>
+		<File RelativePath="..\..\src\fds\part.f90"/>
+		<File RelativePath="..\..\src\fds\pois.f90"/>
+		<File RelativePath="..\..\src\fds\prec.f90"/>
+		<File RelativePath="..\..\src\fds\pres.f90"/>
+		<File RelativePath="..\..\src\fds\radi.f90"/>
+		<File RelativePath="..\..\src\fds\read.f90"/>
+		<File RelativePath="..\..\src\fds\samr.f90"/>
+		<File RelativePath="..\..\src\fds\scrc.f90"/>
+		<File RelativePath="..\..\src\fds\smvv.f90"/>
+		<File RelativePath="..\..\src\fds\soot.f90"/>
+		<File RelativePath="..\..\src\fds\turb.f90"/>
+		<File RelativePath="..\..\src\fds\type.f90"/>
+		<File RelativePath="..\..\src\fds\vege.f90"/>
+		<File RelativePath="..\..\src\fds\velo.f90"/>
+		<File RelativePath="..\..\src\fds\wall.f90"/></Filter>
+		<Filter Name="ms-mpi">
+		<File RelativePath="..\..\src\ms-mpi\mpi.f90"/></Filter></Filter></Files>
+	<Globals/></VisualStudioProject>

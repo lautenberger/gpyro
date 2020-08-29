@@ -1,0 +1,40 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio 2013
+VisualStudioVersion = 12.0.30723.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{6989167D-11E4-40FE-8C1A-2192A86A7E90}") = "gpyro_fds", "gpyro_fds\gpyro_fds.vfproj", "{CE4DF59C-9E90-4FF7-9C15-01A6B3D9FB6A}"
+EndProject
+Project("{6989167D-11E4-40FE-8C1A-2192A86A7E90}") = "gpyro_propest", "gpyro_propest\gpyro_propest.vfproj", "{DFB39287-BEC1-4C80-B711-FE99494FDC8C}"
+EndProject
+Project("{6989167D-11E4-40FE-8C1A-2192A86A7E90}") = "gpyro", "gpyro_standalone\gpyro.vfproj", "{79F89EC7-5E82-4810-A7B2-5B67954F892D}"
+EndProject
+Project("{6989167D-11E4-40FE-8C1A-2192A86A7E90}") = "gpyro_fds_mpi", "gpyro_fds_mpi\gpyro_fds_mpi.vfproj", "{4175FFA4-6A25-49FF-9099-CE6F24F8DD08}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{CE4DF59C-9E90-4FF7-9C15-01A6B3D9FB6A}.Debug|x64.ActiveCfg = Debug|x64
+		{CE4DF59C-9E90-4FF7-9C15-01A6B3D9FB6A}.Debug|x64.Build.0 = Debug|x64
+		{CE4DF59C-9E90-4FF7-9C15-01A6B3D9FB6A}.Release|x64.ActiveCfg = Release|x64
+		{CE4DF59C-9E90-4FF7-9C15-01A6B3D9FB6A}.Release|x64.Build.0 = Release|x64
+		{DFB39287-BEC1-4C80-B711-FE99494FDC8C}.Debug|x64.ActiveCfg = Debug|x64
+		{DFB39287-BEC1-4C80-B711-FE99494FDC8C}.Debug|x64.Build.0 = Debug|x64
+		{DFB39287-BEC1-4C80-B711-FE99494FDC8C}.Release|x64.ActiveCfg = Release|x64
+		{DFB39287-BEC1-4C80-B711-FE99494FDC8C}.Release|x64.Build.0 = Release|x64
+		{79F89EC7-5E82-4810-A7B2-5B67954F892D}.Debug|x64.ActiveCfg = Debug|x64
+		{79F89EC7-5E82-4810-A7B2-5B67954F892D}.Debug|x64.Build.0 = Debug|x64
+		{79F89EC7-5E82-4810-A7B2-5B67954F892D}.Release|x64.ActiveCfg = Release|x64
+		{79F89EC7-5E82-4810-A7B2-5B67954F892D}.Release|x64.Build.0 = Release|x64
+		{4175FFA4-6A25-49FF-9099-CE6F24F8DD08}.Debug|x64.ActiveCfg = Debug|x64
+		{4175FFA4-6A25-49FF-9099-CE6F24F8DD08}.Debug|x64.Build.0 = Debug|x64
+		{4175FFA4-6A25-49FF-9099-CE6F24F8DD08}.Release|x64.ActiveCfg = Release|x64
+		{4175FFA4-6A25-49FF-9099-CE6F24F8DD08}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal

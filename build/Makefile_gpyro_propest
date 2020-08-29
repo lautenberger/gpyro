@@ -1,0 +1,124 @@
+# Gpyro property estimation program makefile - based on old NIST FDS Makefile
+#
+# To compile with the Intel compiler (and MPI) under linux, type: 
+# make intel_linux_mpi
+#
+# To compile with the gfortran (gnu) compiler, type: 
+# make gnu_linux_mpi
+
+# The variable VPATH defines where the source code is relative to the current 
+# directory
+
+VPATH = ../../../src/common ../../../src/propest ../../../src/sce ../../../src/ms-mpi
+
+# Definition of object variables
+
+obj_mpi = gpyro_prec.o propest_vars.o sce_vars.o gpyro_vars.o gpyro_funcs.o gpyro_bc.o gpyro_io.o gpyro_pyro.o gpyro_init.o propest_mpi.o \
+          sce_funcs.o propest_subs.o propest_io.o sce_io.o sce_objfunc.o sce_ua.o sce_init.o propest_main.o 
+
+objwin_mpi = mpi.obj gpyro_prec.obj propest_vars.obj sce_vars.obj gpyro_vars.obj gpyro_funcs.obj gpyro_bc.obj gpyro_io.obj gpyro_pyro.obj gpyro_init.obj propest_mpi.obj \
+          sce_funcs.obj propest_subs.obj propest_io.obj sce_io.obj sce_objfunc.obj sce_ua.obj sce_init.obj propest_main.obj 
+
+#*** General Purpose Rules ***
+no_target:
+	@echo \******** You did not specify a make target \********
+	@echo Please read the comments at the top of the makefile
+
+setup:
+%.o : %.mod
+
+setup_win:
+%.obj : %.mod
+
+.SUFFIXES: .f90 .o .obj
+
+.f90.o:
+	$(FCOMPL) -c $(FFLAGS) $<
+.f90.obj:
+	$(FCOMPL) -c $(FFLAGS) $<
+
+# Intel Compiler
+
+intel_linux_mpi : FFLAGS = -O2 -ip -no-prec-div -axCORE-AVX2
+intel_linux_mpi : FCOMPL = $(GPYRO_FCOMPL_MPI_INTEL)
+intel_linux_mpi : obj = gpyro_propest
+intel_linux_mpi : setup $(obj_mpi)
+	$(FCOMPL) $(FFLAGS) -o $(obj) $(obj_mpi)
+
+intel_linux_mpi_debug : FFLAGS = -O0 -traceback -gen-interfaces -g -check all -debug all
+intel_linux_mpi_debug : FCOMPL = $(GPYRO_FCOMPL_MPI_INTEL)
+intel_linux_mpi_debug : obj = gpyro_propest_debug
+intel_linux_mpi_debug : setup $(obj_mpi)
+	$(FCOMPL) $(FFLAGS) -o $(obj) $(obj_mpi)
+
+intel_win_mpi : MPILIB1 = "C:\Program Files (x86)\Microsoft SDKs\MPI\Lib\x64\msmpi.lib"
+intel_win_mpi : MPILIB2 = "C:\Program Files (x86)\Microsoft SDKs\MPI\Lib\x64\msmpifec.lib"
+intel_win_mpi : MPIINCLUDE = "C:\Program Files (x86)\Microsoft SDKs\MPI\Include\x64"
+intel_win_mpi : FFLAGS = /MP /O2 /Qip /Qno-prec-div /QaxCORE-AVX2 /I $(MPIINCLUDE)
+intel_win_mpi : FCOMPL = ifort
+intel_win_mpi : obj = gpyro_propest
+intel_win_mpi : setup_win $(objwin_mpi)
+	$(FCOMPL) $(FFLAGS) -o $(obj) /F1000000000 $(objwin_mpi) $(MPILIB1) $(MPILIB2)
+
+#Gnu compiler:
+
+gnu_linux_mpi : FFLAGS = -O2 -unroll -frecord-marker=4 -ffree-line-length-none
+gnu_linux_mpi : FCOMPL = $(GPYRO_FCOMPL_MPI_GNU)
+gnu_linux_mpi : obj = gpyro_propest
+gnu_linux_mpi : setup $(obj_mpi)
+	$(FCOMPL) $(FFLAGS) -o $(obj) $(obj_mpi)
+
+gnu_linux_mpi_debug : FFLAGS = -Og -g -Wall -fcheck=all -fbacktrace -fdump-core -ffpe-trap=zero,overflow,underflow -frecord-marker=4 -ffree-line-length-none
+gnu_linux_mpi_debug : FCOMPL = $(GPYRO_FCOMPL_MPI_GNU)
+gnu_linux_mpi_debug : obj = gpyro_propest_debug
+gnu_linux_mpi_debug : setup $(obj_mpi)
+	$(FCOMPL) $(FFLAGS) -o $(obj) $(obj_mpi)
+
+gnu_win_mpi : MPILIB1 = "C:\Program Files (x86)\Microsoft SDKs\MPI\Lib\x64\msmpi.lib"
+gnu_win_mpi : MPILIB2 = "C:\Program Files (x86)\Microsoft SDKs\MPI\Lib\x64\msmpifec.lib"
+gnu_win_mpi : MPIINCLUDE = "C:\Program Files (x86)\Microsoft SDKs\MPI\Include\x64"
+gnu_win_mpi : FFLAGS = -O2 -frecord-marker=4 -ffree-line-length-none -I$(MPIINCLUDE) -L$(MPILIB1) -L$(MPILIB2)
+gnu_win_mpi : FCOMPL = gfortran
+gnu_win_mpi : obj = gpyro_propest
+gnu_win_mpi : setup $(objwin_mpi)
+	$(FCOMPL) $(FFLAGS) -o $(obj) $(objwin_mpi)
+
+#*** End Compiler Specific Rules ***
+
+# *** Object Dependencies ***
+
+gpyro_vars.o : gpyro_prec.o
+gpyro_funcs.o : gpyro_prec.o gpyro_vars.o
+gpyro_io.o : gpyro_prec.o gpyro_vars.o gpyro_funcs.o
+gpyro_bc.o : gpyro_prec.o gpyro_vars.o gpyro_funcs.o
+gpyro_init.o : gpyro_prec.o gpyro_vars.o gpyro_funcs.o gpyro_io.o 
+gpyro_pyro.o : gpyro_prec.o gpyro_vars.o gpyro_funcs.o gpyro_io.o 
+propest_mpi.o : gpyro_vars.o propest_vars.o
+sce_funcs.o : gpyro_prec.o sce_vars.o
+propest_subs.o : propest_vars.o gpyro_vars.o gpyro_prec.o gpyro_init.o gpyro_funcs.o gpyro_io.o gpyro_pyro.o
+propest_io.o : gpyro_prec.o gpyro_vars.o gpyro_funcs.o propest_vars.o propest_subs.o
+propest_main.o : gpyro_prec.o gpyro_vars.o gpyro_funcs.o propest_vars.o propest_subs.o gpyro_init.o gpyro_funcs.o gpyro_io.o sce_funcs.o
+sce_objfunc.o : gpyro_prec.o propest_vars.o gpyro_funcs.o propest_subs.o
+
+gpyro_vars.obj : gpyro_prec.obj
+gpyro_funcs.obj : gpyro_prec.obj gpyro_vars.obj
+gpyro_io.obj : gpyro_prec.obj gpyro_vars.obj gpyro_funcs.obj
+gpyro_bc.obj : gpyro_prec.obj gpyro_vars.obj gpyro_funcs.obj
+gpyro_init.obj : gpyro_prec.obj gpyro_vars.obj gpyro_funcs.obj gpyro_io.obj 
+gpyro_pyro.obj : gpyro_prec.obj gpyro_vars.obj gpyro_funcs.obj gpyro_io.obj 
+propest_mpi.obj : gpyro_vars.obj propest_vars.obj
+sce_funcs.obj : gpyro_prec.obj sce_vars.obj
+propest_subs.obj : propest_vars.obj gpyro_vars.obj gpyro_prec.obj gpyro_init.obj gpyro_funcs.obj gpyro_io.obj gpyro_pyro.obj
+propest_io.obj : gpyro_prec.obj gpyro_vars.obj gpyro_funcs.obj propest_vars.obj propest_subs.obj
+propest_main.obj : gpyro_prec.obj gpyro_vars.obj gpyro_funcs.obj propest_vars.obj propest_subs.obj gpyro_init.obj gpyro_funcs.obj gpyro_io.obj sce_funcs.obj
+sce_objfunc.obj : gpyro_prec.obj propest_vars.obj gpyro_funcs.obj propest_subs.obj
+
+#*** Clean Target to remove Object and Module files ***
+
+.PHONY : clean
+clean:
+	-rm -f *.o *.mod *.obj 
+
+.PHONY : winclean
+winclean:
+	-erase *.mod *.obj 

@@ -1,0 +1,94 @@
+MODULE GA_VARS
+
+USE PREC
+
+IMPLICIT NONE
+
+CHARACTER(1) :: PATH_SEPARATOR
+CHARACTER(7) :: OPERATING_SYSTEM, DELETECOMMAND
+CHARACTER(8) :: COPYCOMMAND
+
+TYPE  :: VAR_TYPE
+   CHARACTER(60)    :: SHEET_NAME
+   INTEGER          :: I1
+   INTEGER          :: I2
+   CHARACTER(60)    :: CTYPE
+   REAL(EB)         :: MINVAL
+   REAL(EB)         :: MAXVAL
+   LOGICAL          :: USE_LOG
+   REAL(EB)         :: PMUT
+   REAL(EB)         :: VMUTMAX
+   INTEGER          :: IVARPAIR
+END TYPE
+
+TYPE  :: INDIVIDUAL_TYPE
+   REAL(EB) :: VALUE
+   REAL(EB) :: FITNESS
+END TYPE
+
+TYPE :: EXP_DATA_TYPE
+   INTEGER :: NDT
+   REAL(EB), POINTER, DIMENSION(:) :: T
+   REAL(EB), POINTER, DIMENSION(:) :: Y
+   REAL(EB) :: YBAR
+END TYPE EXP_DATA_TYPE
+
+TYPE :: PHI_TYPE
+   INTEGER      :: ICASE
+   CHARACTER(3) :: CTYPE
+   REAL(EB)     :: XT 
+   REAL(EB)     :: YT 
+   REAL(EB)     :: ZT 
+   REAL(EB)     :: TSTOP 
+   REAL(EB)     :: PHI
+   REAL(EB)     :: EPS 
+   INTEGER      :: IX_TMP
+   INTEGER      :: IY_TMP
+   INTEGER      :: IZ_TMP
+END TYPE
+
+TYPE :: GA_TYPE
+
+   INTEGER  :: NPHI, NREPOPULATED, NNOTCONVERGED,NDTMAX,ICASEDTMAX
+   REAL(EB) :: MAXFITEVER,MAXPOSSIBLEFIT,TSA
+
+   TYPE (EXP_DATA_TYPE), POINTER, DIMENSION (:) :: EXPDATA
+   TYPE (EXP_DATA_TYPE), POINTER, DIMENSION (:) :: TRYDATA
+   TYPE (PHI_TYPE)     , POINTER, DIMENSION (:) :: PHI
+   TYPE (VAR_TYPE)     , POINTER, DIMENSION (:) :: VAR
+
+   REAL(EB),POINTER, DIMENSION(:) :: CUMPROB,TIGO,OLDFIT
+   INTEGER, POINTER, DIMENSION(:) :: NCOPIES,NDT,IPARENT
+   LOGICAL, POINTER, DIMENSION(:) :: REPOPULATED,NOTCONVERGED
+
+   REAL(EB), POINTER, DIMENSION(:,:) :: INDIV,FIT,YI0,OLDPOP
+   REAL(EB), POINTER, DIMENSION(:)   :: SUMYI0
+
+! MPI stuff
+   INTEGER :: IRANK,NPROC, MPIFITSIZE 
+   LOGICAL :: MPI
+         
+! Variables read in from GenInput
+   INTEGER ::  NINDIV,   & ! Number of indivisuals
+               NGEN,     & ! Number of generations
+               NGENE,    & ! Number of genes (variables)
+               MAXCOPIES   ! Maximum copies of an individual
+
+   LOGICAL  :: SIMULATED_EXPERIMENTAL_DATA, & !Use simulated exp data?
+               RESTART, & !Read initial population from restart file?
+               BRUTE_FORCE, &
+               KILL_NONCONVERGED_SOLNS, &
+               ISOTROPIC_THERMAL_CONDUCTIVITY, &
+               ISOTROPIC_PERMEABILITY, &
+               DUMP_INTERMEDIATE_TRIALS, &
+               DUMP_ALL_RESULTS_BEST, &
+               SPECIFY_CML_DIRECTLY
+     
+   REAL(EB) :: FITMIN,FITCLIP,FITEXPONENT,WHOLEGENEFRAC,ASA,BSA
+   CHARACTER(30) :: OPTIMIZATION_TYPE
+         
+END TYPE
+
+TYPE (GA_TYPE), TARGET :: GA
+
+END MODULE GA_VARS

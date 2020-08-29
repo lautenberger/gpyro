@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<VisualStudioProject ProjectCreator="Intel Fortran" Keyword="Console Application" Version="11.0" ProjectIdGuid="{DFB39287-BEC1-4C80-B711-FE99494FDC8C}">
+	<Platforms>
+		<Platform Name="x64"/></Platforms>
+	<Configurations>
+		<Configuration Name="Debug|x64" DeleteExtensionsOnClean="*.obj;*.mod;*.pdb;*.asm;*.map;*.dyn;*.dpi;*.tmp;*.log;*.ilk;*.exe;$(TargetPath)">
+				<Tool Name="VFFortranCompilerTool" SuppressStartupBanner="true" DebugInformationFormat="debugEnabled" MultiProcessorCompilation="true" Optimization="optimizeDisabled" AdditionalIncludeDirectories="C:\Program Files (x86)\Microsoft SDKs\MPI\Include\x64" AlternateParameterSyntax="false" WarnUnusedVariables="true" ModulePath="$(INTDIR)/" ObjectFile="$(INTDIR)/" Traceback="true" BoundsCheck="true" UninitializedVariablesCheck="true" DescriptorDataTypeCheck="true" DescriptorDataSizeCheck="true" RuntimeLibrary="rtQuickWinDebug"/>
+				<Tool Name="VFLinkerTool" LinkIncremental="linkIncrementalNo" SuppressStartupBanner="true" AdditionalLibraryDirectories="C:\Program Files (x86)\Microsoft SDKs\MPI\Lib\x64" IgnoreDefaultLibraryNames="/NODEFAULTLIB:LIBCMT" GenerateManifest="false" ManifestFile="" GenerateDebugInformation="true" ProgramDatabaseFile="$(OUTDIR)/gpyro_propest.pdb" SubSystem="subSystemConsole" HeapReserveSize="100000000" HeapCommitSize="100000000" StackReserveSize="100000000" StackCommitSize="100000000" LargeAddressAware="addrAwareLarge" AdditionalDependencies="msmpi.lib msmpifec.lib"/>
+				<Tool Name="VFResourceCompilerTool"/>
+				<Tool Name="VFMidlTool" SuppressStartupBanner="true" TargetEnvironment="midlTargetAMD64" HeaderFileName="$(InputName).h" TypeLibraryName="$(IntDir)/$(InputName).tlb"/>
+				<Tool Name="VFCustomBuildTool"/>
+				<Tool Name="VFPreLinkEventTool"/>
+				<Tool Name="VFPreBuildEventTool"/>
+				<Tool Name="VFPostBuildEventTool"/>
+				<Tool Name="VFManifestTool" SuppressStartupBanner="true"/></Configuration>
+		<Configuration Name="Release|x64" DeleteExtensionsOnClean="*.obj;*.mod;*.pdb;*.asm;*.map;*.dyn;*.dpi;*.tmp;*.log;*.ilk;*.exe;$(TargetPath)">
+				<Tool Name="VFFortranCompilerTool" AdditionalOptions="/QxAVX" SuppressStartupBanner="true" MultiProcessorCompilation="true" AdditionalIncludeDirectories="C:\Program Files (x86)\Microsoft SDKs\MPI\Include\x64" ModulePath="$(INTDIR)/" ObjectFile="$(INTDIR)/"/>
+				<Tool Name="VFLinkerTool" LinkIncremental="linkIncrementalNo" SuppressStartupBanner="true" AdditionalLibraryDirectories="C:\Program Files (x86)\Microsoft SDKs\MPI\Lib\x64" GenerateManifest="false" ManifestFile="" SubSystem="subSystemConsole" HeapReserveSize="100000000" HeapCommitSize="100000000" StackReserveSize="100000000" StackCommitSize="100000000" LargeAddressAware="addrAwareLarge" AdditionalDependencies="msmpi.lib msmpifec.lib"/>
+				<Tool Name="VFResourceCompilerTool"/>
+				<Tool Name="VFMidlTool" SuppressStartupBanner="true" TargetEnvironment="midlTargetAMD64" HeaderFileName="$(InputName).h" TypeLibraryName="$(IntDir)/$(InputName).tlb"/>
+				<Tool Name="VFCustomBuildTool"/>
+				<Tool Name="VFPreLinkEventTool"/>
+				<Tool Name="VFPreBuildEventTool"/>
+				<Tool Name="VFPostBuildEventTool"/>
+				<Tool Name="VFManifestTool" SuppressStartupBanner="true"/></Configuration></Configurations>
+	<Files>
+		<Filter Name="Header Files" Filter="fi;fd">
+		<File RelativePath="..\..\src\ms-mpi\mpifptr.h"/></Filter>
+		<Filter Name="Resource Files" Filter="rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe"/>
+		<Filter Name="Source Files" Filter="f90;for;f;fpp;ftn;def;odl;idl">
+		<Filter Name="common">
+		<File RelativePath="..\..\src\common\gpyro_bc.f90"/>
+		<File RelativePath="..\..\src\common\gpyro_funcs.f90"/>
+		<File RelativePath="..\..\src\common\gpyro_init.f90"/>
+		<File RelativePath="..\..\src\common\gpyro_io.f90"/>
+		<File RelativePath="..\..\src\common\gpyro_prec.f90"/>
+		<File RelativePath="..\..\src\common\gpyro_pyro.f90"/>
+		<File RelativePath="..\..\src\common\gpyro_vars.f90"/></Filter>
+		<Filter Name="ms-mpi">
+		<File RelativePath="..\..\src\ms-mpi\mpi.f90"/></Filter>
+		<Filter Name="sce">
+		<File RelativePath="..\..\src\sce\sce_funcs.f90"/>
+		<File RelativePath="..\..\src\sce\sce_init.f90"/>
+		<File RelativePath="..\..\src\sce\sce_io.f90"/>
+		<File RelativePath="..\..\src\sce\sce_objfunc.f90"/>
+		<File RelativePath="..\..\src\sce\sce_ua.f90"/>
+		<File RelativePath="..\..\src\sce\sce_vars.f90"/></Filter>
+		<File RelativePath="..\..\src\propest\propest_io.f90"/>
+		<File RelativePath="..\..\src\propest\propest_main.f90"/>
+		<File RelativePath="..\..\src\propest\propest_mpi.f90"/>
+		<File RelativePath="..\..\src\propest\propest_subs.f90"/>
+		<File RelativePath="..\..\src\propest\propest_vars.f90"/></Filter></Files>
+	<Globals/></VisualStudioProject>
