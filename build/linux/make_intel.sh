@@ -8,24 +8,25 @@ GPYRO_VER=0.8200
 # similar to the following to your ~/.bashrc file:
 #
 # export GPYRO_FCOMPL_SERIAL_INTEL=ifort
-# export GPYRO_FCOMPL_MPI_INTEL=/usr/local/openmpi-1.10.3_intel/bin/mpifort
+# export GPYRO_FCOMPL_MPI_INTEL=/usr/local/openmpi-4.0.3_intel/bin/mpifort
 # export GPYRO_FCOMPL_SERIAL_GNU=gfortran
-# export GPYRO_FCOMPL_MPI_GNU=/usr/local/openmpi-1.10.3_gnu/bin/mpifort
+# export GPYRO_FCOMPL_MPI_GNU=/usr/local/openmpi-4.0.3_gnu/bin/mpifort
 # export GPYRO_BINARY_DIRECTORY=/usr/local/bin
 
-# Check if environment variables are set and export if not: 
+# Check if environment variables are set and export if not:
 if [ -z "$GPYRO_FCOMPL_SERIAL_INTEL" ]; then
    export GPYRO_FCOMPL_SERIAL_INTEL=ifort
 fi
 
 if [ -z "$GPYRO_FCOMPL_MPI_INTEL" ]; then
-   export GPYRO_FCOMPL_MPI_INTEL=/usr/local/openmpi-2.1.0_intel/bin/mpifort
+   export GPYRO_FCOMPL_MPI_INTEL=/usr/local/openmpi-4.0.3_intel/bin/mpifort
 fi
 
 if [ -z "$GPYRO_BINARY_DIRECTORY" ]; then
    GPYRO_BINARY_DIRECTORY=/usr/local/bin
 fi
 
+mkdir gpyro 2> /dev/null
 cd gpyro
 
 rm -f *.o *.mod gpyro
@@ -43,6 +44,7 @@ make -f ../../Makefile_gpyro intel_linux_debug
 sudo cp -f gpyro_debug $GPYRO_BINARY_DIRECTORY/gpyro_${GPYRO_VER}_debug_intel
 rm -f *.o *.mod
 
+mkdir ../gpyro_propest 2> /dev/null
 cd ../gpyro_propest
 
 rm -f *.o *.mod gpyro_propest
@@ -55,6 +57,7 @@ make -f ../../Makefile_gpyro_propest intel_linux_mpi_debug
 sudo cp -f gpyro_propest $GPYRO_BINARY_DIRECTORY/gpyro_propest_${GPYRO_VER}_debug_intel
 rm -f *.o *.mod
 
+mkdir ../gpyro_fds 2> /dev/null
 cd ../gpyro_fds
 
 rm -f *.o *.mod
